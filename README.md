@@ -3,6 +3,8 @@
 تطبيق ويب متكامل (Full-Stack): واجهة React + TypeScript، خادم Node.js/Express + TypeScript،
 قاعدة بيانات PostgreSQL حقيقية، مصادقة بجلسات آمنة وصلاحيات مفروضة في الخادم.
 
+**النسخة المنشورة:** https://lughati.onrender.com
+
 **إعداد وتنفيذ: أ. مها الحمادي**
 مديرة المدرسة: أ. بدور الجارد
 

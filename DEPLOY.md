@@ -1,5 +1,13 @@
 # نشر منصة لغتي مجاناً — Render + Neon
 
+> **✅ المنشور حالياً**
+> - المنصة: https://lughati.onrender.com
+> - المستودع: https://github.com/hamadasalama/lughati
+> - لوحة Render: https://dashboard.render.com/web/srv-dbl4df1srm7s738p8nk0
+> - قاعدة Neon: مشروع `lughati` — منطقة Frankfurt — PostgreSQL 17
+>
+> كلمة المرور الأولية لحساب `maha` تُسلَّم بشكل منفصل ولا تُكتب في المستودع. غيّريها فوراً من **الإعدادات ← الأمان**.
+
 هذا الدليل ينشر المنصة كاملة (واجهة React + خادم Express + PostgreSQL) على خطة مجانية:
 
 - **Render** لاستضافة الخادم والواجهة من نفس النطاق (HTTPS مجاني).
@@ -27,30 +35,25 @@
 
 ## 2) رفع الكود إلى GitHub
 
-المشروع لا يحتوي مستودع Git بعد. من جذر المشروع:
+> ✅ تم إنشاء المستودع وربطه: `origin` → `https://github.com/hamadasalama/lughati.git`
+
+لتحديث الكود لاحقاً يكفي:
 
 ```bash
-git init -b main
-git config user.name "Maha"
-git config user.email "your-email@example.com"
 git add .
-git commit -m "منصة لغتي — جاهزة للنشر"
+git commit -m "وصف التعديل"
+git push
 ```
 
-ثم أنشئي مستودعاً جديداً على GitHub باسم `lughati` (بدون README أو .gitignore)، واربطيه:
-
-```bash
-git remote add origin https://github.com/USERNAME/lughati.git
-git push -u origin main
-```
-
-استبدلي `USERNAME` باسم حسابك على GitHub.
+وإن أردتِ إعادة الربط من جهاز آخر: `git remote add origin https://github.com/hamadasalama/lughati.git && git push -u origin main`.
 
 > ملف `.env` ومجلدات `uploads` و`dist` مستثناة تلقائياً في `.gitignore`، فلا تُرفع الأسرار.
 
 ---
 
 ## 3) النشر على Render
+
+> ✅ تم إنشاء الخدمة ونشرها. هذه الخطوات للإشارة إذا احتجتِ إعادة الإنشاء.
 
 1. افتحي [render.com](https://render.com) وسجّلي الدخول بحساب GitHub.
 2. **New** ← **Blueprint**.
@@ -74,7 +77,7 @@ git push -u origin main
 ## 4) أول دخول
 
 - اسم المستخدم: **`maha`**
-- كلمة المرور: القيمة التي وضعتها في `ADMIN_PASSWORD`.
+- كلمة المرور: القيمة التي وضعتها في `ADMIN_PASSWORD` (وصلتكِ منفصلة عند النشر).
 
 بعد الدخول:
 1. افتحي **الإعدادات** وغيّري كلمة المرور إلى كلمة تعرفينها فقط.
