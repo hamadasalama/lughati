@@ -7,7 +7,9 @@ import { hashPassword } from '../services/auth';
 
 async function createAdmin() {
   const username = (process.env.ADMIN_USERNAME || 'maha').trim().toLowerCase();
-  const password = process.env.ADMIN_PASSWORD || 'lughati1234';
+  const password = process.env.ADMIN_PASSWORD || (env.nodeEnv === 'production' ? '' : 'lughati1234');
+  // في الإنتاج لا نسمح بكلمة المرور الافتراضية المهروبة داخل الكود
+  if (!password) throw new Error('ADMIN_PASSWORD مطلوب في الإنتاج لإنشاء حساب المعلمة');
   const { rowCount } = await q('SELECT 1 FROM users WHERE username = $1', [username]);
   if (rowCount) { console.log('حساب المعلمة موجود مسبقاً:', username); return; }
   await q("INSERT INTO users(username, password_hash, role) VALUES ($1,$2,'teacher')",
