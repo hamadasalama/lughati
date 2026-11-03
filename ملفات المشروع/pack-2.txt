@@ -1,0 +1,427 @@
+# pack-2.txt — نواة الخادم (14 ملفاً)
+# يحفظ بجانب install.bat وpack-1.txt ثم يُشغَّل install.bat
+
+//<<<FILE: backend/package.json>>>
+{
+  "name": "lughati-backend",
+  "private": true,
+  "version": "2.0.0",
+  "scripts": {
+    "db:create": "tsx src/scripts/create-db.ts",
+    "migrate": "tsx src/scripts/migrate.ts",
+    "seed": "tsx src/scripts/seed.ts",
+    "import:students": "tsx src/scripts/import-students.ts",
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.7",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.6",
+    "@types/multer": "^1.4.11",
+    "@types/node": "^20.14.0",
+    "@types/pg": "^8.11.6",
+    "@types/supertest": "^6.0.2",
+    "supertest": "^7.0.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}
+//<<<END>>>
+
+//<<<FILE: backend/tsconfig.json>>>
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "types": ["node"]
+  },
+  "include": ["src"]
+}
+//<<<END>>>
+
+//<<<FILE: backend/vitest.config.ts>>>
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  // الجذر = جذر المشروع كي يجد vitest مجلد tests الموجود خارج backend
+  // (npm test يشغَّل من مجلد backend عبر سكربت الحزمة)
+  root: '..',
+  test: {
+    environment: 'node',
+    include: ['tests/**/*.test.ts'],
+    testTimeout: 30000,
+    // بالتتابع لا بالتوازي: كل ملفات الاختبار تفرّغ قاعدة الاختبار نفسها وتعيد بذرها
+    fileParallelism: false
+  }
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/config.ts>>>
+// الإعدادات تأتي من متغيرات البيئة فقط — لا سرّ في كود الواجهة مطلقاً
+import dotenv from 'dotenv';
+import path from 'path';
+
+// .env في جذر المشروع بينما الأوامر تعمل من مجلد backend — لذلك المسار صريح،
+// مع محاولة ثانية من مجلد التشغيل الحالي (dotenv لا يستبدل متغيراً موجوداً مسبقاً)
+dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+dotenv.config();
+
+const req = (k: string, d?: string): string => {
+  const v = process.env[k] ?? d;
+  if (v === undefined) throw new Error('متغير بيئة مفقود: ' + k + ' (تأكدي من وجود ملف .env في جذر المشروع)');
+  return v;
+};
+
+export const env = {
+  nodeEnv: process.env.NODE_ENV ?? 'development',
+  port: +req('PORT', '4000'),
+  databaseUrl: req('DATABASE_URL'),
+  jwtSecret: req('JWT_SECRET'),
+  corsOrigin: req('CORS_ORIGIN', 'http://localhost:5173'),
+  uploadDir: req('UPLOAD_DIR', 'uploads'),
+  maxUploadMb: +req('MAX_UPLOAD_MB', '6'),
+  migrationsDir: req('MIGRATIONS_DIR', path.resolve(__dirname, '../../database/migrations')),
+  seedsDir: req('SEEDS_DIR', path.resolve(__dirname, '../../database/seeds')),
+  uploadDirAbs: path.resolve(__dirname, '..', req('UPLOAD_DIR', 'uploads'))
+};
+//<<<END>>>
+
+//<<<FILE: backend/src/database/pool.ts>>>
+import { Pool, QueryResult, types } from 'pg';
+import { env } from '../config';
+
+// date كنص YYYY-MM-DD، numeric/int8 كأرقام — حتى لا تتفاجأ الواجهة بسلاسل
+types.setTypeParser(1082, v => v);
+types.setTypeParser(1700, v => (v === null ? null : parseFloat(v)));
+types.setTypeParser(20,   v => (v === null ? null : parseInt(v, 10)));
+
+export const pool = new Pool({ connectionString: env.databaseUrl, max: 10 });
+export function q<T = any>(text: string, params: any[] = []): Promise<QueryResult<T>> {
+  return pool.query(text, params);
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/middleware/errors.ts>>>
+import { Request, Response, NextFunction } from 'express';
+
+export class HttpError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+type H = (req: Request, res: Response, next: NextFunction) => unknown;
+export const wrap = (fn: H) => (req: Request, res: Response, next: NextFunction) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+export function notFound(_req: Request, res: Response) { res.status(404).json({ error: 'المسار غير موجود' }); }
+export function errorHandler(err: any, _req: Request, res: Response, _next: NextFunction) {
+  const status = err instanceof HttpError ? err.status : 500;
+  if (status >= 500) console.error(err);
+  res.status(status).json({ error: err.message || 'حدث خطأ في الخادم' });
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/middleware/auth.ts>>>
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+import { env } from '../config';
+import { q } from '../database/pool';
+import { HttpError, wrap } from './errors';
+
+export const COOKIE = 'lg_tok';
+export interface AuthUser {
+  id: number; username: string; role: 'teacher' | 'student' | 'admin';
+  studentId: number | null; name?: string; tokenVersion: number;
+}
+declare global {
+  namespace Express { interface Request { user?: AuthUser } }
+}
+
+export function setAuthCookie(res: Response, token: string) {
+  res.cookie(COOKIE, token, {
+    httpOnly: true, sameSite: 'lax', secure: env.nodeEnv === 'production',
+    maxAge: 8 * 3600 * 1000, path: '/'
+  });
+}
+export function clearAuthCookie(res: Response) { res.clearCookie(COOKIE, { path: '/' }); }
+
+export const requireAuth = wrap(async (req: Request, _res: Response, next: NextFunction) => {
+  const tok = (req as any).cookies?.[COOKIE];
+  if (!tok) throw new HttpError(401, 'الجلسة منتهية، يرجى تسجيل الدخول');
+  let p: any;
+  try { p = jwt.verify(tok, env.jwtSecret); } catch { throw new HttpError(401, 'الجلسة منتهية، يرجى تسجيل الدخول'); }
+  // الدور وحالة الحساب مصدرهما قاعدة البيانات في كل طلب — لا يُوثق بما يقوله المتصفح
+  const { rows } = await q<any>(
+    'SELECT u.id, u.username, u.role, u.active, u.token_version, u.student_id, s.name AS student_name ' +
+    'FROM users u LEFT JOIN students s ON s.id = u.student_id WHERE u.id = $1', [p.uid]);
+  const u = rows[0];
+  if (!u || !u.active || u.token_version !== p.tv) throw new HttpError(401, 'الجلسة غير صالحة');
+  req.user = {
+    id: u.id, username: u.username, role: u.role, tokenVersion: u.token_version,
+    studentId: u.student_id, name: u.student_name ?? undefined
+  };
+  next();
+});
+
+export const requireRole = (...roles: string[]) =>
+  wrap((req: Request, _res: Response, next: NextFunction) => {
+    if (!req.user) throw new HttpError(401, 'غير مصادق');
+    if (!roles.includes(req.user.role)) throw new HttpError(403, 'غير مصرح بهذه العملية لدورك');
+    next();
+  });
+
+/** تُمنع الطالبة من أي student_id ليس معرّفها — تُستدعى داخل الخدمات نفسها كخط دفاع ثانٍ */
+export function assertStudentAccess(user: AuthUser, studentId: number) {
+  if (user.role === 'student' && user.studentId !== studentId)
+    throw new HttpError(403, 'غير مصرح بالوصول لهذه البيانات');
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/middleware/upload.ts>>>
+import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs';
+import multer from 'multer';
+import { env } from '../config';
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => { fs.mkdirSync(env.uploadDirAbs, { recursive: true }); cb(null, env.uploadDirAbs); },
+  filename: (_req, file, cb) => cb(null, crypto.randomUUID() + path.extname(file.originalname || ''))
+});
+export const upload = multer({
+  storage,
+  limits: { fileSize: env.maxUploadMb * 1024 * 1024, files: 10 }
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/app.ts>>>
+import express from 'express';
+import path from 'path';
+import fs from 'fs';
+import cors from 'cors';
+import cookieParser from 'cookie-parser';
+import { env } from './config';
+import { q } from './database/pool';
+import { notFound, errorHandler } from './middleware/errors';
+import authRoutes from './routes/auth';
+import usersRoutes from './routes/users';
+import studentsRoutes from './routes/students';
+import evaluationsRoutes from './routes/evaluations';
+import worksheetsRoutes from './routes/worksheets';
+import testsRoutes from './routes/tests';
+import plansRoutes from './routes/plans';
+import skillsRoutes from './routes/skills';
+import messagesRoutes from './routes/messages';
+import starRoutes from './routes/star';
+import achievementsRoutes from './routes/achievements';
+import filesRoutes from './routes/files';
+import reportsRoutes from './routes/reports';
+import settingsRoutes from './routes/settings';
+import auditRoutes from './routes/audit';
+
+export function createApp(opts: { staticDir?: string } = {}) {
+  const app = express();
+  app.use(cors({ origin: env.corsOrigin, credentials: true }));
+  app.use(express.json({ limit: '1mb' }));
+  app.use(cookieParser());
+
+  // فحص صحة فعلي: يلمس قاعدة البيانات حقيقةً
+  app.get('/api/health', async (_req, res) => {
+    const { rows } = await q('SELECT now() AS now');
+    res.json({ status: 'ok', db: 'ok', now: rows[0].now });
+  });
+
+  app.use('/api/auth', authRoutes);
+  app.use('/api/users', usersRoutes);
+  app.use('/api/students', studentsRoutes);
+  app.use('/api/evaluations', evaluationsRoutes);
+  app.use('/api/worksheets', worksheetsRoutes);
+  app.use('/api/tests', testsRoutes);
+  app.use('/api/plans', plansRoutes);
+  app.use('/api/skills', skillsRoutes);
+  app.use('/api/messages', messagesRoutes);
+  app.use('/api/star', starRoutes);
+  app.use('/api/achievements', achievementsRoutes);
+  app.use('/api/files', filesRoutes);
+  app.use('/api/reports', reportsRoutes);
+  app.use('/api/settings', settingsRoutes);
+  app.use('/api/audit', auditRoutes);
+
+  // في الإنتاج: تقديم واجهة React المبنية من نفس الخادم
+  if (opts.staticDir && fs.existsSync(opts.staticDir)) {
+    app.use(express.static(opts.staticDir));
+    app.use((req, res, next) => {
+      if (req.method === 'GET' && !req.path.startsWith('/api'))
+        return res.sendFile(path.join(opts.staticDir!, 'index.html'));
+      next();
+    });
+  }
+
+  app.use(notFound);
+  app.use(errorHandler);
+  return app;
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/server.ts>>>
+import path from 'path';
+import { createApp } from './app';
+import { env } from './config';
+import { pool } from './database/pool';
+
+const app = createApp({ staticDir: path.resolve(__dirname, '../../frontend/dist') });
+
+app.listen(env.port, async () => {
+  console.log('✔ منصة لغتي تعمل على المنفذ ' + env.port);
+  try { await pool.query('SELECT 1'); console.log('✔ اتصال قاعدة البيانات سليم'); }
+  catch (e) { console.error('✖ تعذر الاتصال بقاعدة البيانات — راجعي DATABASE_URL', e); }
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/scripts/create-db.ts>>>
+// ينشئ قاعدة البيانات إن لم توجد. لقاعدة الاختبار: npm run db:create -- test
+import { Client } from 'pg';
+import { env } from '../config';
+
+async function main() {
+  let target = env.databaseUrl;
+  if (process.argv[2] === 'test') {
+    if (!process.env.TEST_DATABASE_URL)
+      throw new Error('قاعدة الاختبار تحتاج TEST_DATABASE_URL في ملف .env');
+    target = process.env.TEST_DATABASE_URL;
+  }
+  const url = new URL(target);
+  const dbName = decodeURIComponent(url.pathname.replace(/^\//, ''));
+  if (!dbName) throw new Error('سلسلة الاتصال لا تحتوي اسم قاعدة البيانات');
+  url.pathname = '/postgres'; // الاتصال بقاعدة النظام لإنشاء القاعدة الجديدة
+  const c = new Client({ connectionString: url.toString() });
+  await c.connect();
+  const r = await c.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
+  if (!r.rowCount) {
+    await c.query('CREATE DATABASE "' + dbName.replace(/"/g, '') + '"');
+    console.log('✔ أُنشئت القاعدة:', dbName);
+  } else {
+    console.log('القاعدة موجودة مسبقاً:', dbName);
+  }
+  await c.end();
+}
+
+main().catch(e => { console.error('✖ فشل إنشاء قاعدة البيانات:', e.message); process.exit(1); });
+//<<<END>>>
+
+//<<<FILE: backend/src/scripts/migrate.ts>>>
+import fs from 'fs';
+import path from 'path';
+import { env } from '../config';
+import { pool } from '../database/pool';
+
+export async function runMigrations(dir = env.migrationsDir) {
+  await pool.query('CREATE TABLE IF NOT EXISTS schema_migrations(name varchar(120) PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort();
+  for (const f of files) {
+    const done = await pool.query('SELECT 1 FROM schema_migrations WHERE name = $1', [f]);
+    if (done.rowCount) continue;
+    await pool.query(fs.readFileSync(path.join(dir, f), 'utf8'));
+    await pool.query('INSERT INTO schema_migrations(name) VALUES ($1)', [f]);
+    console.log('✔ migration:', f);
+  }
+}
+
+if (require.main === module) {
+  runMigrations()
+    .then(() => pool.end())
+    .then(() => process.exit(0))
+    .catch(e => { console.error('✖ فشل الترحيل:', e.message); process.exit(1); });
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/scripts/seed.ts>>>
+import fs from 'fs';
+import path from 'path';
+import { env } from '../config';
+import { pool, q } from '../database/pool';
+import { runMigrations } from './migrate';
+import { hashPassword } from '../services/auth';
+
+async function createAdmin() {
+  const username = (process.env.ADMIN_USERNAME || 'admin').trim().toLowerCase();
+  const password = process.env.ADMIN_PASSWORD || 'lughati1234';
+  const { rowCount } = await q('SELECT 1 FROM users WHERE username = $1', [username]);
+  if (rowCount) { console.log('حساب المعلمة موجود مسبقاً:', username); return; }
+  await q("INSERT INTO users(username, password_hash, role) VALUES ($1,$2,'teacher')",
+    [username, await hashPassword(password)]);
+  console.log('✔ أُنشئ حساب المعلمة — اسم المستخدم: ' + username + ' (غيّري كلمة المرور فوراً من الإعدادات)');
+}
+
+async function main() {
+  await runMigrations();
+  const seedFile = path.join(env.seedsDir, 'seed.sql');
+  if (fs.existsSync(seedFile)) {
+    await pool.query(fs.readFileSync(seedFile, 'utf8')); // idempotent: ON CONFLICT DO NOTHING
+    console.log('✔ seed.sql نُفّذ');
+  } else {
+    console.log('-- لا يوجد seed.sql — تم تجاوز البذر');
+  }
+  await createAdmin();
+  await pool.end();
+}
+
+main().catch(e => { console.error('✖ فشل البذر:', e.message); process.exit(1); });
+//<<<END>>>
+
+//<<<FILE: backend/src/scripts/import-students.ts>>>
+// الاستخدام: npm run import:students -- ../database/seeds/students.csv
+// كل سطر: الاسم,الصف,الشعبة (الرأس والأسطر التي تبدأ بـ # تُتجاهل، المكرر يُتخطى تلقائياً)
+import fs from 'fs';
+import path from 'path';
+import { pool, q } from '../database/pool';
+import { runMigrations } from './migrate';
+
+async function main() {
+  const file = process.argv[2];
+  if (!file) throw new Error('الاستخدام: npm run import:students -- ملف.csv');
+  await runMigrations();
+
+  const lines = fs.readFileSync(path.resolve(file), 'utf8').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  let added = 0, skipped = 0;
+  for (const [i, line] of lines.entries()) {
+    if (line.startsWith('#')) continue;
+    const cols = line.split(/[,;\t،]/).map(c => c.trim()).filter(Boolean);
+    if (!cols.length) continue;
+    const [name, gradeIn, sectionIn] = cols;
+    if (i === 0 && /^(الاسم|name)$/i.test(name)) continue;
+    const grade = gradeIn || 'الرابع';
+    const section = sectionIn || 'أ';
+    const ex = await q('SELECT 1 FROM students WHERE name = $1 AND grade = $2 AND section = $3', [name, grade, section]);
+    if (ex.rowCount) { skipped++; continue; }
+    const r = await q(
+      "INSERT INTO students(code, name, grade, section) VALUES ('TMP-' || md5(random()::text), $1,$2,$3) RETURNING id",
+      [name, grade, section]);
+    await q("UPDATE students SET code = 'ST-' || lpad(id::text, 3, '0') WHERE id = $1", [r.rows[0].id]);
+    added++;
+  }
+  console.log('أُضيف ' + added + ' طالبة، وتخطي ' + skipped + ' (مكرر/غير مكتمل)');
+  await pool.end();
+}
+
+main().catch(e => { console.error('✖ فشل الاستيراد:', e.message); process.exit(1); });
+//<<<END>>>

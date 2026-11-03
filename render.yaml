@@ -1,0 +1,30 @@
+# Render Blueprint — نشر منصة لغتي على الخطة المجانية
+# الاستضافة تستخدم قرصاً مؤقتاً، لذلك تُحفظ المرفقات داخل PostgreSQL أيضاً (الترحيل 005).
+services:
+  - type: web
+    name: lughati
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci --include=dev && npm run build
+    # seed يطبّق الترحيلات وينشئ حساب المعلمة إن لم يكن موجوداً (idempotent)
+    startCommand: node backend/dist/scripts/seed.js && node backend/dist/server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false # رابط Neon (Pooled connection + sslmode=require)
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_USERNAME
+        value: maha
+      - key: ADMIN_PASSWORD
+        sync: false # كلمة مرور قوية تُدخل في لوحة Render
+      - key: TRUST_PROXY
+        value: "1"
+      - key: UPLOAD_DIR
+        value: uploads
+      - key: MAX_UPLOAD_MB
+        value: "6"

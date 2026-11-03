@@ -1,0 +1,1393 @@
+# pack-3.txt — الخدمات + Controllers + Routes + package.json الجذر (47 ملفاً)
+# يشمل تحديثاً لملف واحد من pack-2 (errors.ts) — يُكتب فوقه تلقائياً
+
+//<<<FILE: package.json>>>
+{
+  "name": "lughati",
+  "private": true,
+  "version": "2.0.0",
+  "workspaces": ["backend", "frontend"],
+  "scripts": {
+    "db:create": "npm run db:create -w backend",
+    "migrate": "npm run migrate -w backend",
+    "seed": "npm run seed -w backend",
+    "import:students": "npm run import:students -w backend",
+    "dev:server": "npm run dev -w backend",
+    "dev:web": "npm run dev -w frontend",
+    "build": "npm run build -w frontend && npm run build -w backend",
+    "start": "npm run start -w backend",
+    "test": "npm run test -w backend"
+  }
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/middleware/errors.ts>>>
+import { Request, Response, NextFunction } from 'express';
+
+export class HttpError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+type H = (req: Request, res: Response, next: NextFunction) => unknown;
+export const wrap = (fn: H) => (req: Request, res: Response, next: NextFunction) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+export function notFound(_req: Request, res: Response) { res.status(404).json({ error: 'المسار غير موجود' }); }
+export function errorHandler(err: any, _req: Request, res: Response, _next: NextFunction) {
+  let status = err instanceof HttpError ? err.status : 500;
+  // ملف مرفوع أكبر من الحد المسموح: رسالة واضحة بحالة 400 بدل 500
+  if (err?.code === 'LIMIT_FILE_SIZE') { status = 400; err.message = 'حجم الملف أكبر من الحد المسموح'; }
+  if (status >= 500) console.error(err);
+  res.status(status).json({ error: err.message || 'حدث خطأ في الخادم' });
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/auth.ts>>>
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { env } from '../config';
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+
+// حد بسيط ضد التخمين: 5 محاولات فاشلة → قفل 15 دقيقة لنفس اسم المستخدم
+const fails = new Map<string, { n: number; until: number }>();
+
+export const hashPassword = (plain: string) => bcrypt.hash(plain, 10);
+export const verifyPassword = (plain: string, hash: string) => bcrypt.compare(plain, hash);
+
+export async function login(username: string, password: string) {
+  const key = String(username ?? '').trim().toLowerCase();
+  const f = fails.get(key);
+  // القفل فعّال طوال مدته بغض النظر عن العدّاد
+  if (f && f.until > Date.now())
+    throw new HttpError(429, 'تم تجاوز عدد المحاولات المسموح، حاولي بعد قليل');
+  const { rows } = await q<any>(
+    'SELECT id, username, password_hash, role, active, token_version, student_id FROM users WHERE lower(username) = $1',
+    [key]);
+  const u = rows[0];
+  if (!u || !(await verifyPassword(String(password ?? ''), u.password_hash))) {
+    const c = fails.get(key) ?? { n: 0, until: 0 };
+    c.n++;
+    if (c.n >= 5) { c.until = Date.now() + 15 * 60 * 1000; c.n = 0; }
+    fails.set(key, c);
+    throw new HttpError(401, 'اسم المستخدم أو كلمة المرور غير صحيحة');
+  }
+  if (!u.active) throw new HttpError(403, 'هذا الحساب موقوف، يرجى مراجعة المعلمة');
+  fails.delete(key);
+  const token = jwt.sign({ uid: u.id, tv: u.token_version }, env.jwtSecret, { expiresIn: '8h' });
+  return { token, user: { id: u.id, username: u.username, role: u.role, student_id: u.student_id } };
+}
+
+export async function changePassword(userId: number, newPassword: string, current?: string, requireCurrent = false) {
+  const { rows } = await q<{ password_hash: string }>('SELECT password_hash FROM users WHERE id = $1', [userId]);
+  if (!rows[0]) throw new HttpError(404, 'المستخدم غير موجود');
+  if (requireCurrent) {
+    if (!current) throw new HttpError(400, 'أدخلي كلمة المرور الحالية');
+    if (!(await verifyPassword(current, rows[0].password_hash))) throw new HttpError(400, 'كلمة المرور الحالية غير صحيحة');
+  }
+  if (!newPassword || String(newPassword).length < 6) throw new HttpError(400, 'كلمة المرور يجب ألا تقل عن 6 أحرف');
+  await q('UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2',
+    [await hashPassword(newPassword), userId]);
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/audit.ts>>>
+import { Request } from 'express';
+import { q } from '../database/pool';
+
+export async function audit(req: Request, action: string, entity: string, entityId?: string | number | null, details?: unknown) {
+  const u = req.user;
+  await q(
+    'INSERT INTO audit_logs(user_id, username, role, action, entity, entity_id, details, ip) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+    [u?.id ?? null, u?.username ?? null, u?.role ?? null, action, entity,
+     entityId != null ? String(entityId) : null, details ?? null, (req as any).ip ?? null]);
+}
+
+export async function list(opts: { limit?: number; user_id?: number }) {
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+  const { rows } = await q(
+    'SELECT * FROM audit_logs WHERE ($1::int IS NULL OR user_id = $1) ORDER BY at DESC LIMIT $2',
+    [opts.user_id ?? null, limit]);
+  return rows;
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/students.ts>>>
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser } from '../middleware/auth';
+
+export async function list(f: { grade?: string; section?: string; q?: string }) {
+  const { rows } = await q(
+    `SELECT * FROM students
+     WHERE active AND ($1::text IS NULL OR grade = $1) AND ($2::text IS NULL OR section = $2)
+       AND ($3::text IS NULL OR name ILIKE '%' || $3 || '%' OR code ILIKE '%' || $3 || '%')
+     ORDER BY grade, section, name`,
+    [f.grade || null, f.section || null, f.q || null]);
+  return rows;
+}
+
+export async function get(user: AuthUser, id: number) {
+  if (user.role === 'student' && user.studentId !== id)
+    throw new HttpError(403, 'غير مصرح بالوصول لهذه البيانات');
+  const { rows } = await q('SELECT * FROM students WHERE id = $1', [id]);
+  if (!rows[0]) throw new HttpError(404, 'الطالبة غير موجودة');
+  return rows[0];
+}
+
+async function assertNew(name: any, grade: any, section: any) {
+  if (!name || !String(name).trim()) throw new HttpError(400, 'اسم الطالبة مطلوب');
+  if (!grade || !section) throw new HttpError(400, 'الصف والشعبة مطلوبان');
+}
+
+export async function create(b: any, userId: number) {
+  await assertNew(b.name, b.grade, b.section);
+  const manual = b.code && String(b.code).trim();
+  const code = manual ? String(b.code).trim() : 'TMP-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+  let s: any;
+  try {
+    const { rows } = await q(
+      'INSERT INTO students(code, name, grade, section, notes) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+      [code, String(b.name).trim(), b.grade, b.section, b.notes || null]);
+    s = rows[0];
+  } catch (e: any) {
+    if (e.code === '23505') throw new HttpError(409, 'هذا الرمز مستخدم مسبقاً');
+    throw e;
+  }
+  if (!manual) await q("UPDATE students SET code = 'ST-' || lpad(id::text, 3, '0') WHERE id = $1", [s.id]);
+  return { ...s, code: manual ? s.code : 'ST-' + String(s.id).padStart(3, '0') };
+}
+
+export async function update(id: number, b: any) {
+  const { rows } = await q(
+    `UPDATE students SET
+       name    = COALESCE($2, name),
+       grade   = COALESCE($3, grade),
+       section = COALESCE($4, section),
+       notes   = COALESCE($5, notes),
+       active  = COALESCE($6, active)
+     WHERE id = $1 RETURNING *`,
+    [id, b.name ?? null, b.grade ?? null, b.section ?? null, b.notes ?? null, b.active ?? null]);
+  if (!rows[0]) throw new HttpError(404, 'الطالبة غير موجودة');
+  return rows[0];
+}
+
+export async function remove(id: number) {
+  const { rows } = await q('DELETE FROM students WHERE id = $1 RETURNING id, name', [id]);
+  if (!rows[0]) throw new HttpError(404, 'الطالبة غير موجودة');
+  return rows[0];
+}
+
+/** استيراد جماعي: يتجاهل المكرر (اسم + صف + شعبة) ويرجع الإحصاء */
+export async function importRows(rowsIn: any[]) {
+  if (!Array.isArray(rowsIn) || !rowsIn.length) throw new HttpError(400, 'لا توجد صفوف للاستيراد');
+  let added = 0, skipped = 0;
+  for (const r of rowsIn.slice(0, 1000)) {
+    const name = String(r.name ?? '').trim();
+    const grade = String(r.grade ?? '').trim();
+    const section = String(r.section ?? '').trim();
+    if (!name || !grade || !section) { skipped++; continue; }
+    const ex = await q('SELECT 1 FROM students WHERE name = $1 AND grade = $2 AND section = $3', [name, grade, section]);
+    if (ex.rowCount) { skipped++; continue; }
+    const ins = await q(
+      "INSERT INTO students(code, name, grade, section) VALUES ('TMP-' || md5(random()::text), $1,$2,$3) RETURNING id",
+      [name, grade, section]);
+    await q("UPDATE students SET code = 'ST-' || lpad(id::text, 3, '0') WHERE id = $1", [ins.rows[0].id]);
+    added++;
+  }
+  return { added, skipped };
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/evaluations.ts>>>
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser, assertStudentAccess } from '../middleware/auth';
+
+const isDate = (s: any) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+const score = (v: any) => {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 5) throw new HttpError(400, 'الدرجة يجب أن تكون بين 1 و 5');
+  return n;
+};
+
+export async function list(user: AuthUser, f: { student_id?: string; from?: string; to?: string }) {
+  let sid: number;
+  if (user.role === 'student') {
+    // الطالبة التي تطلب صراحةً بيانات طالبة أخرى تُرفض 403 — لا تجاوز صامت
+    if (f.student_id !== undefined && f.student_id !== '' && Number(f.student_id) !== user.studentId)
+      throw new HttpError(403, 'غير مصرح بالوصول لهذه البيانات');
+    sid = user.studentId!;
+  } else {
+    sid = Number(f.student_id);
+  }
+  if (!sid) throw new HttpError(400, 'حددي طالبة');
+  assertStudentAccess(user, sid);
+  const { rows } = await q(
+    `SELECT * FROM evaluations WHERE student_id = $1
+       AND ($2::date IS NULL OR eval_date >= $2) AND ($3::date IS NULL OR eval_date <= $3)
+     ORDER BY eval_date DESC, id DESC`,
+    [sid, f.from || null, f.to || null]);
+  return rows;
+}
+
+export async function create(user: AuthUser, b: any) {
+  const sid = Number(b.student_id);
+  if (!sid) throw new HttpError(400, 'حددي الطالبة');
+  if (!isDate(b.eval_date)) throw new HttpError(400, 'التاريخ غير صالح');
+  const attendance = b.attendance;
+  if (!['present', 'excused', 'absent'].includes(attendance)) throw new HttpError(400, 'حالة الحضور غير صالحة');
+  const st = await q('SELECT 1 FROM students WHERE id = $1', [sid]);
+  if (!st.rowCount) throw new HttpError(404, 'الطالبة غير موجودة');
+  let behavior: number | null = null, participation: number | null = null, homework: number | null = null;
+  if (attendance === 'present') {
+    behavior = score(b.behavior); participation = score(b.participation); homework = score(b.homework);
+    if (behavior === null || participation === null || homework === null)
+      throw new HttpError(400, 'أكملي درجات السلوك والمشاركة والواجب');
+  } else if (b.behavior != null || b.participation != null || b.homework != null) {
+    throw new HttpError(400, 'لا تُسجَّل درجات لطالبة غير حاضرة'); // الحضور مستقل عن الدرجات
+  }
+  const { rows } = await q(
+    `INSERT INTO evaluations(student_id, eval_date, attendance, behavior, participation, homework, notes, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [sid, b.eval_date, attendance, behavior, participation, homework, b.notes || null, user.id]);
+  return rows[0];
+}
+
+export async function remove(id: number) {
+  const { rows } = await q('DELETE FROM evaluations WHERE id = $1 RETURNING id, student_id', [id]);
+  if (!rows[0]) throw new HttpError(404, 'التقييم غير موجود');
+  return rows[0];
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/worksheets.ts>>>
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser } from '../middleware/auth';
+import { UpFile } from '../middleware/upload';
+import * as filesSvc from './files';
+
+export async function list(user: AuthUser, f: { grade?: string; section?: string }) {
+  if (user.role === 'student') {
+    const sid = user.studentId!;
+    const { rows } = await q(
+      `SELECT w.id, w.title, w.description, w.grade, w.section, w.work_date,
+              COALESCE(t.done, false) AS done,
+              (SELECT id FROM files fi WHERE fi.worksheet_id = w.id LIMIT 1) AS file_id
+       FROM worksheets w
+       LEFT JOIN worksheet_targets t ON t.worksheet_id = w.id AND t.student_id = $1
+       WHERE w.grade = (SELECT grade FROM students WHERE id = $1)
+         AND w.section = (SELECT section FROM students WHERE id = $1)
+         AND (NOT EXISTS (SELECT 1 FROM worksheet_targets x WHERE x.worksheet_id = w.id)
+              OR t.student_id IS NOT NULL)
+       ORDER BY w.work_date DESC, w.id DESC`, [sid]);
+    return rows;
+  }
+  const { rows } = await q(
+    `SELECT w.*,
+       COALESCE(json_agg(json_build_object('student_id', s.id, 'name', s.name, 'done', t.done) ORDER BY s.name)
+                FILTER (WHERE s.id IS NOT NULL), '[]') AS targets
+     FROM worksheets w
+     LEFT JOIN worksheet_targets t ON t.worksheet_id = w.id
+     LEFT JOIN students s ON s.id = t.student_id
+     WHERE ($1::text IS NULL OR w.grade = $1) AND ($2::text IS NULL OR w.section = $2)
+     GROUP BY w.id ORDER BY w.work_date DESC, w.id DESC`,
+    [f.grade || null, f.section || null]);
+  return rows;
+}
+
+export async function create(user: AuthUser, b: any, file?: UpFile) {
+  if (!b.title || !String(b.title).trim()) throw new HttpError(400, 'عنوان ورقة العمل مطلوب');
+  if (!b.grade || !b.section) throw new HttpError(400, 'الصف والشعبة مطلوبان');
+  const { rows } = await q(
+    `INSERT INTO worksheets(title, description, grade, section, work_date, created_by)
+     VALUES ($1,$2,$3,$4, COALESCE($5::date, CURRENT_DATE), $6) RETURNING *`,
+    [String(b.title).trim(), b.description || null, b.grade, b.section, b.work_date || null, user.id]);
+  const w = rows[0];
+  const ids: number[] = Array.isArray(b.ids) ? b.ids.map(Number).filter(Boolean) : [];
+  if (ids.length) {
+    await q(
+      'INSERT INTO worksheet_targets(worksheet_id, student_id) SELECT $1, id FROM students WHERE id = ANY($2::int[]) ON CONFLICT DO NOTHING',
+      [w.id, ids]);
+  }
+  if (file) await filesSvc.register({
+    stored_name: file.filename, original_name: file.originalname, mime: file.mimetype,
+    size: file.size, kind: 'worksheet', student_id: null, worksheet_id: w.id, achievement_id: null, uploaded_by: user.id
+  });
+  return w;
+}
+
+export async function setStatus(worksheetId: number, studentId: number, done: boolean) {
+  const { rows } = await q(
+    `INSERT INTO worksheet_targets(worksheet_id, student_id, done) VALUES ($1,$2,$3)
+     ON CONFLICT (worksheet_id, student_id) DO UPDATE SET done = EXCLUDED.done, updated_at = now()
+     RETURNING *`, [worksheetId, studentId, done]);
+  return rows[0];
+}
+
+export async function remove(id: number) {
+  await filesSvc.deleteFor('worksheet_id', id); // مرفقات الورقة تُحذف من القرص أيضاً
+  const { rows } = await q('DELETE FROM worksheets WHERE id = $1 RETURNING id', [id]);
+  if (!rows[0]) throw new HttpError(404, 'ورقة العمل غير موجودة');
+  return rows[0];
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/tests.ts>>>
+import { q, pool } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser } from '../middleware/auth';
+
+const norm = (r: any) => ({ ...r, score: r.score == null ? null : Number(r.score), max_score: Number(r.max_score) });
+
+export async function list(user: AuthUser, f: { kind?: string; grade?: string; section?: string }) {
+  if (user.role === 'student') {
+    const sid = user.studentId!;
+    const { rows } = await q(
+      `SELECT t.id, t.title, t.kind, t.max_score, t.test_date, r.score, r.note
+       FROM tests t
+       LEFT JOIN results r ON r.test_id = t.id AND r.student_id = $1
+       WHERE t.grade = (SELECT grade FROM students WHERE id = $1)
+         AND t.section = (SELECT section FROM students WHERE id = $1)
+         AND ($2::text IS NULL OR t.kind = $2)
+       ORDER BY t.test_date DESC, t.id DESC`, [sid, f.kind || null]);
+    return rows.map(norm);
+  }
+  const { rows } = await q(
+    `SELECT t.*, (SELECT count(*) FROM results r WHERE r.test_id = t.id) AS results_count
+     FROM tests t
+     WHERE ($1::text IS NULL OR t.kind = $1) AND ($2::text IS NULL OR t.grade = $2) AND ($3::text IS NULL OR t.section = $3)
+     ORDER BY t.test_date DESC, t.id DESC`, [f.kind || null, f.grade || null, f.section || null]);
+  return rows.map(norm);
+}
+
+export async function create(user: AuthUser, b: any) {
+  if (!b.title || !String(b.title).trim()) throw new HttpError(400, 'عنوان الاختبار مطلوب');
+  if (!['test', 'nafis'].includes(b.kind)) throw new HttpError(400, 'نوع الاختبار غير صالح');
+  const max = Number(b.max_score);
+  if (!Number.isFinite(max) || max <= 0) throw new HttpError(400, 'الدرجة العظمى غير صالحة');
+  if (!b.grade || !b.section) throw new HttpError(400, 'الصف والشعبة مطلوبان');
+  const { rows } = await q(
+    `INSERT INTO tests(title, kind, max_score, test_date, grade, section, created_by)
+     VALUES ($1,$2,$3, COALESCE($4::date, CURRENT_DATE), $5,$6,$7) RETURNING *`,
+    [String(b.title).trim(), b.kind, max, b.test_date || null, b.grade, b.section, user.id]);
+  return norm(rows[0]);
+}
+
+export async function saveResults(user: AuthUser, testId: number, rowsIn: any[]) {
+  const t = await q('SELECT * FROM tests WHERE id = $1', [testId]);
+  if (!t.rows[0]) throw new HttpError(404, 'الاختبار غير موجود');
+  const max = Number(t.rows[0].max_score);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const r of rowsIn ?? []) {
+      const sid = Number(r.student_id), sc = Number(r.score);
+      if (!sid || !Number.isFinite(sc) || sc < 0 || sc > max)
+        throw new HttpError(400, 'درجة غير صالحة (تأكدي أنها بين 0 والدرجة العظمى)');
+      await client.query(
+        `INSERT INTO results(test_id, student_id, score, note) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (test_id, student_id) DO UPDATE SET score = EXCLUDED.score, note = EXCLUDED.note, updated_at = now()`,
+        [testId, sid, sc, r.note || null]);
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; }
+  finally { client.release(); }
+  return { saved: (rowsIn ?? []).length, test_id: testId, updated_by: user.id };
+}
+
+export async function remove(id: number) {
+  const { rows } = await q('DELETE FROM tests WHERE id = $1 RETURNING id', [id]);
+  if (!rows[0]) throw new HttpError(404, 'الاختبار غير موجود');
+  return rows[0];
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/plans.ts>>>
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser, assertStudentAccess } from '../middleware/auth';
+
+export async function list(user: AuthUser, studentId?: number) {
+  const sid = user.role === 'student' ? user.studentId! : (studentId ?? null);
+  assertStudentAccess(user, sid ?? -1);
+  const { rows } = await q(
+    `SELECT p.*, COALESCE(json_agg(json_build_object('id', f.id, 'follow_date', f.follow_date, 'note', f.note) ORDER BY f.follow_date)
+             FILTER (WHERE f.id IS NOT NULL), '[]') AS followups
+     FROM plans p LEFT JOIN plan_followups f ON f.plan_id = p.id
+     WHERE ($1::int IS NULL OR p.student_id = $1)
+     GROUP BY p.id ORDER BY p.status, p.to_date DESC NULLS LAST`, [sid]);
+  return rows;
+}
+
+export async function create(user: AuthUser, b: any) {
+  const sid = Number(b.student_id);
+  if (!sid) throw new HttpError(400, 'حددي الطالبة');
+  if (!b.title || !String(b.title).trim()) throw new HttpError(400, 'عنوان الخطة مطلوب');
+  const { rows } = await q(
+    `INSERT INTO plans(student_id, title, goal, actions, from_date, to_date, created_by)
+     VALUES ($1,$2,$3,$4,$5::date,$6::date,$7) RETURNING *`,
+    [sid, String(b.title).trim(), b.goal || null, b.actions || null, b.from_date || null, b.to_date || null, user.id]);
+  return rows[0];
+}
+
+export async function update(id: number, b: any) {
+  const { rows } = await q(
+    `UPDATE plans SET title = COALESCE($2, title), goal = COALESCE($3, goal), actions = COALESCE($4, actions),
+       from_date = COALESCE($5::date, from_date), to_date = COALESCE($6::date, to_date), status = COALESCE($7, status)
+     WHERE id = $1 RETURNING *`,
+    [id, b.title ?? null, b.goal ?? null, b.actions ?? null, b.from_date ?? null, b.to_date ?? null, b.status ?? null]);
+  if (!rows[0]) throw new HttpError(404, 'الخطة غير موجودة');
+  return rows[0];
+}
+
+export async function addFollowup(user: AuthUser, planId: number, b: any) {
+  if (!b.note || !String(b.note).trim()) throw new HttpError(400, 'ملاحظة المتابعة مطلوبة');
+  const { rows } = await q(
+    'INSERT INTO plan_followups(plan_id, follow_date, note) VALUES ($1, COALESCE($2::date, CURRENT_DATE), $3) RETURNING *',
+    [planId, b.follow_date || null, String(b.note).trim()]);
+  return rows[0];
+}
+
+export async function remove(id: number) {
+  const { rows } = await q('DELETE FROM plans WHERE id = $1 RETURNING id', [id]);
+  if (!rows[0]) throw new HttpError(404, 'الخطة غير موجودة');
+  return rows[0];
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/skills.ts>>>
+import { q, pool } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser, assertStudentAccess } from '../middleware/auth';
+
+export async function list(user: AuthUser, studentId?: number) {
+  if (user.role === 'student') {
+    const sid = user.studentId!;
+    const { rows } = await q(
+      `SELECT sk.id, sk.name, sk.description, l.level, l.note
+       FROM skills sk LEFT JOIN skill_levels l ON l.skill_id = sk.id AND l.student_id = $1
+       ORDER BY sk.name`, [sid]);
+    return rows;
+  }
+  const sid = studentId ?? null;
+  assertStudentAccess(user, sid ?? -1);
+  const { rows } = await q(
+    `SELECT sk.*, COALESCE(json_agg(json_build_object('student_id', l.student_id, 'level', l.level, 'note', l.note))
+            FILTER (WHERE l.student_id IS NOT NULL), '[]') AS levels
+     FROM skills sk LEFT JOIN skill_levels l ON l.skill_id = sk.id
+       AND ($1::int IS NULL OR l.student_id = $1)
+     GROUP BY sk.id ORDER BY sk.name`, [sid]);
+  return rows;
+}
+
+export async function create(user: AuthUser, b: any) {
+  if (!b.name || !String(b.name).trim()) throw new HttpError(400, 'اسم المهارة مطلوب');
+  try {
+    const { rows } = await q('INSERT INTO skills(name, description) VALUES ($1,$2) RETURNING *',
+      [String(b.name).trim(), b.description || null]);
+    return rows[0];
+  } catch (e: any) {
+    if (e.code === '23505') throw new HttpError(409, 'هذه المهارة موجودة مسبقاً');
+    throw e;
+  }
+}
+
+export async function setLevels(user: AuthUser, skillId: number, rowsIn: any[]) {
+  const sk = await q('SELECT 1 FROM skills WHERE id = $1', [skillId]);
+  if (!sk.rowCount) throw new HttpError(404, 'المهارة غير موجودة');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const r of rowsIn ?? []) {
+      const sid = Number(r.student_id), lv = Number(r.level);
+      if (!sid || !Number.isInteger(lv) || lv < 1 || lv > 5)
+        throw new HttpError(400, 'مستوى الإتقان يجب أن يكون بين 1 و 5');
+      await client.query(
+        `INSERT INTO skill_levels(skill_id, student_id, level, note) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (skill_id, student_id) DO UPDATE SET level = EXCLUDED.level, note = EXCLUDED.note, updated_at = now()`,
+        [skillId, sid, lv, r.note || null]);
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; }
+  finally { client.release(); }
+  return { saved: (rowsIn ?? []).length, skill_id: skillId, updated_by: user.id };
+}
+
+export async function remove(id: number) {
+  const { rows } = await q('DELETE FROM skills WHERE id = $1 RETURNING id', [id]);
+  if (!rows[0]) throw new HttpError(404, 'المهارة غير موجودة');
+  return rows[0];
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/messages.ts>>>
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser, assertStudentAccess } from '../middleware/auth';
+
+export async function threads() { // للمعلمة: كل المحادثات مع غير المقروء
+  const { rows } = await q(
+    `SELECT s.id AS student_id, s.name, s.grade, s.section,
+            m.body AS last_body, m.sent_at AS last_at, m.sender AS last_sender,
+            (SELECT count(*) FROM messages x
+              WHERE x.student_id = s.id AND x.sender = 'student' AND x.seen_teacher = false) AS unread
+     FROM students s
+     LEFT JOIN LATERAL (SELECT * FROM messages m WHERE m.student_id = s.id ORDER BY m.sent_at DESC LIMIT 1) m ON true
+     WHERE s.active
+     ORDER BY (SELECT count(*) FROM messages x WHERE x.student_id = s.id AND x.sender='student' AND x.seen_teacher=false) DESC,
+              m.sent_at DESC NULLS LAST, s.name`);
+  return rows;
+}
+
+export async function thread(user: AuthUser, studentId: number) {
+  assertStudentAccess(user, studentId);
+  if (user.role === 'student')
+    await q("UPDATE messages SET seen_student = true WHERE student_id = $1 AND sender = 'teacher' AND seen_student = false", [studentId]);
+  else
+    await q("UPDATE messages SET seen_teacher = true WHERE student_id = $1 AND sender = 'student' AND seen_teacher = false", [studentId]);
+  const { rows } = await q(
+    'SELECT id, sender, body, sent_at FROM messages WHERE student_id = $1 ORDER BY sent_at ASC LIMIT 200', [studentId]);
+  return rows;
+}
+
+export async function send(user: AuthUser, studentId: number, body: string) {
+  assertStudentAccess(user, studentId);
+  const text = String(body ?? '').trim();
+  if (!text) throw new HttpError(400, 'نص الرسالة مطلوب');
+  if (text.length > 4000) throw new HttpError(400, 'الرسالة طويلة جداً');
+  const { rows } = await q(
+    'INSERT INTO messages(student_id, sender, body) VALUES ($1,$2,$3) RETURNING *',
+    [studentId, user.role === 'student' ? 'student' : 'teacher', text]);
+  return rows[0];
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/star.ts>>>
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser } from '../middleware/auth';
+
+export function sundayOf(dstr: string): string {
+  const d = new Date(dstr + 'T00:00:00Z');
+  if (isNaN(d.getTime())) throw new HttpError(400, 'التاريخ غير صالح');
+  d.setUTCDate(d.getUTCDate() - d.getUTCDay()); // بداية الأسبوع = الأحد
+  return d.toISOString().slice(0, 10);
+}
+
+export async function current() {
+  const ws = sundayOf(new Date().toISOString().slice(0, 10));
+  const { rows } = await q(
+    `SELECT w.*, s.name AS student_name FROM weekly_star w JOIN students s ON s.id = w.student_id
+     WHERE w.week_start = $1`, [ws]);
+  return rows[0] ?? null;
+}
+
+export async function list(from?: string, to?: string) {
+  const { rows } = await q(
+    `SELECT w.*, s.name AS student_name FROM weekly_star w JOIN students s ON s.id = w.student_id
+     WHERE ($1::date IS NULL OR w.week_start >= $1) AND ($2::date IS NULL OR w.week_start <= $2)
+     ORDER BY w.week_start DESC`, [from || null, to || null]);
+  return rows;
+}
+
+export async function put(user: AuthUser, b: any) {
+  const sid = Number(b.student_id);
+  if (!sid) throw new HttpError(400, 'حددي الطالبة');
+  const ws = sundayOf(b.date || new Date().toISOString().slice(0, 10));
+  const st = await q('SELECT 1 FROM students WHERE id = $1', [sid]);
+  if (!st.rowCount) throw new HttpError(404, 'الطالبة غير موجودة');
+  const { rows } = await q(
+    `INSERT INTO weekly_star(week_start, week_label, student_id, reason, created_by)
+     VALUES ($1, 'أسبوع ' || $1::text, $2, $3, $4)
+     ON CONFLICT (week_start) DO UPDATE SET student_id = EXCLUDED.student_id, reason = EXCLUDED.reason
+     RETURNING *`, [ws, sid, b.reason || null, user.id]);
+  return rows[0];
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/achievements.ts>>>
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser } from '../middleware/auth';
+import { UpFile } from '../middleware/upload';
+import * as filesSvc from './files';
+
+export async function list(user: AuthUser) {
+  if (user.role === 'student') {
+    const { rows } = await q(
+      `SELECT a.*, (SELECT count(*) FROM files f WHERE f.achievement_id = a.id) AS files_count
+       FROM achievements a WHERE a.visible ORDER BY a.ach_date DESC, a.id DESC`);
+    return rows;
+  }
+  const { rows } = await q(
+    `SELECT a.*, (SELECT count(*) FROM files f WHERE f.achievement_id = a.id) AS files_count
+     FROM achievements a ORDER BY a.ach_date DESC, a.id DESC`);
+  return rows;
+}
+
+export async function create(user: AuthUser, b: any, files: UpFile[]) {
+  if (!b.title || !String(b.title).trim()) throw new HttpError(400, 'عنوان الإنجاز مطلوب');
+  const { rows } = await q(
+    `INSERT INTO achievements(title, description, category, ach_date, visible, created_by)
+     VALUES ($1,$2, COALESCE($3,'أخرى'), COALESCE($4::date, CURRENT_DATE), COALESCE($5, true), $6) RETURNING *`,
+    [String(b.title).trim(), b.description || null, b.category || null, b.ach_date || null, b.visible ?? null, user.id]);
+  const a = rows[0];
+  for (const f of files ?? []) await filesSvc.register({
+    stored_name: f.filename, original_name: f.originalname, mime: f.mimetype, size: f.size,
+    kind: 'achievement', student_id: null, worksheet_id: null, achievement_id: a.id, uploaded_by: user.id
+  });
+  return a;
+}
+
+export async function update(id: number, b: any) {
+  const { rows } = await q(
+    `UPDATE achievements SET title = COALESCE($2, title), description = COALESCE($3, description),
+       category = COALESCE($4, category), ach_date = COALESCE($5::date, ach_date), visible = COALESCE($6, visible)
+     WHERE id = $1 RETURNING *`,
+    [id, b.title ?? null, b.description ?? null, b.category ?? null, b.ach_date ?? null, b.visible ?? null]);
+  if (!rows[0]) throw new HttpError(404, 'الإنجاز غير موجود');
+  return rows[0];
+}
+
+export async function remove(id: number) {
+  await filesSvc.deleteFor('achievement_id', id); // يحذف الملفات من القرص أيضاً
+  const { rows } = await q('DELETE FROM achievements WHERE id = $1 RETURNING id', [id]);
+  if (!rows[0]) throw new HttpError(404, 'الإنجاز غير موجود');
+  return rows[0];
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/files.ts>>>
+import fs from 'fs';
+import path from 'path';
+import { q } from '../database/pool';
+import { env } from '../config';
+import { AuthUser } from '../middleware/auth';
+
+export async function register(f: {
+  stored_name: string; original_name: string; mime: string; size: number; kind: string;
+  student_id: number | null; worksheet_id: number | null; achievement_id: number | null; uploaded_by: number;
+}) {
+  const { rows } = await q(
+    `INSERT INTO files(stored_name, original_name, mime, size_bytes, kind, student_id, worksheet_id, achievement_id, uploaded_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+    [f.stored_name, f.original_name, f.mime, f.size, f.kind, f.student_id, f.worksheet_id, f.achievement_id, f.uploaded_by]);
+  return rows[0];
+}
+
+export async function getForDownload(id: number) {
+  const { rows } = await q(
+    'SELECT f.*, a.visible AS achievement_visible FROM files f LEFT JOIN achievements a ON a.id = f.achievement_id WHERE f.id = $1',
+    [id]);
+  return rows[0] ?? null;
+}
+
+/** قاعدة الوصول: الطالبة تصل فقط لملفها الخاص، أو ورقة عمل صفية، أو مرفق إنجاز معلن، أو شعار — غير ذلك 404 بلا كشف */
+export function accessible(user: AuthUser, f: any): boolean {
+  if (user.role !== 'student') return true;
+  if (f.kind === 'logo') return true; // شعارا المدرسة والوزارة غير حساسان
+  if (f.student_id != null) return f.student_id === user.studentId;
+  if (f.kind === 'worksheet') return true;
+  if (f.kind === 'achievement') return !!f.achievement_visible;
+  return false;
+}
+
+export function unlinkSafe(storedName: string) {
+  try { fs.unlinkSync(path.join(env.uploadDirAbs, storedName)); } catch { /* الملف غير موجود — لا مشكلة */ }
+}
+
+export async function deleteFor(column: 'achievement_id' | 'worksheet_id', id: number) {
+  const { rows } = await q(`DELETE FROM files WHERE ${column} = $1 RETURNING stored_name`, [id]);
+  for (const r of rows) unlinkSafe(r.stored_name);
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/reports.ts>>>
+import { q } from '../database/pool';
+import { AuthUser, assertStudentAccess } from '../middleware/auth';
+
+/** اتجاه الطالبة: لا يُصدَر حكم قبل 4 تقييمات حاضرة على الأقل */
+function trend(series: { d: string; v: number }[]) {
+  if (series.length < 4) return { enough: false, n: series.length, slope: null };
+  const xs = series.map(e => Date.parse(e.d) / 86400000), ys = series.map(e => e.v);
+  const n = xs.length, mx = xs.reduce((a, b) => a + b) / n, my = ys.reduce((a, b) => a + b) / n;
+  let a1 = 0, b1 = 0;
+  for (let i = 0; i < n; i++) { a1 += (xs[i] - mx) * (ys[i] - my); b1 += (xs[i] - mx) ** 2; }
+  return { enough: true, n, slope: b1 ? +(a1 / b1).toFixed(4) : 0 };
+}
+
+export async function summary(f: { from?: string; to?: string; grade?: string; section?: string }) {
+  const { rows } = await q(
+    `SELECT s.id, s.code, s.name, s.grade, s.section,
+       count(e.id) FILTER (WHERE e.attendance = 'present')  AS present,
+       count(e.id) FILTER (WHERE e.attendance = 'excused')  AS excused,
+       count(e.id) FILTER (WHERE e.attendance = 'absent')   AS absent,
+       round(avg(e.behavior)      FILTER (WHERE e.attendance = 'present')::numeric, 2)::float8 AS behavior,
+       round(avg(e.participation) FILTER (WHERE e.attendance = 'present')::numeric, 2)::float8 AS participation,
+       round(avg(e.homework)      FILTER (WHERE e.attendance = 'present')::numeric, 2)::float8 AS homework,
+       max(e.eval_date) AS last_eval
+     FROM students s
+     LEFT JOIN evaluations e ON e.student_id = s.id
+       AND ($1::date IS NULL OR e.eval_date >= $1) AND ($2::date IS NULL OR e.eval_date <= $2)
+     WHERE s.active AND ($3::text IS NULL OR s.grade = $3) AND ($4::text IS NULL OR s.section = $4)
+     GROUP BY s.id ORDER BY s.grade, s.section, s.name`,
+    [f.from || null, f.to || null, f.grade || null, f.section || null]);
+
+  const { rows: series } = await q(
+    `SELECT student_id, eval_date AS d,
+       ((COALESCE(behavior,0) + COALESCE(participation,0) + COALESCE(homework,0))
+        / NULLIF((behavior IS NOT NULL)::int + (participation IS NOT NULL)::int + (homework IS NOT NULL)::int, 0))::float8 AS v
+     FROM evaluations
+     WHERE attendance = 'present' AND ($1::date IS NULL OR eval_date >= $1) AND ($2::date IS NULL OR eval_date <= $2)
+     ORDER BY student_id, eval_date`, [f.from || null, f.to || null]);
+
+  const byS = new Map<number, { d: string; v: number }[]>();
+  for (const r of series) {
+    if (!byS.has(r.student_id)) byS.set(r.student_id, []);
+    byS.get(r.student_id)!.push({ d: r.d, v: r.v });
+  }
+  return rows.map(r => ({ ...r, trend: trend(byS.get(r.id) ?? []) }));
+}
+
+export async function compare(f: any) {
+  const [a, b] = await Promise.all([
+    summary({ from: f.fromA, to: f.toA, grade: f.grade, section: f.section }),
+    summary({ from: f.fromB, to: f.toB, grade: f.grade, section: f.section })
+  ]);
+  const mapB = new Map(b.map((r: any) => [r.id, r]));
+  return a.map((ra: any) => {
+    const rb: any = mapB.get(ra.id);
+    const delta = (k: string) => (rb && ra[k] != null && rb[k] != null) ? +(rb[k] - ra[k]).toFixed(2) : null;
+    return {
+      student: { id: ra.id, name: ra.name, grade: ra.grade, section: ra.section },
+      periodA: ra, periodB: rb ?? null,
+      delta: { behavior: delta('behavior'), participation: delta('participation'), homework: delta('homework') },
+      trendEnough: ra.trend.enough && (!rb || rb.trend.enough) // لا مقارنة اتجاه بدون بيانات كافية
+    };
+  });
+}
+
+export async function studentReport(user: AuthUser, id: number, f: { from?: string; to?: string }) {
+  assertStudentAccess(user, id);
+  const [st, evals, counts, tests, worksheets, plans, skills, stars] = await Promise.all([
+    q('SELECT * FROM students WHERE id = $1', [id]),
+    q(`SELECT * FROM evaluations WHERE student_id = $1 AND ($2::date IS NULL OR eval_date >= $2)
+         AND ($3::date IS NULL OR eval_date <= $3) ORDER BY eval_date DESC, id DESC`, [id, f.from || null, f.to || null]),
+    q(`SELECT count(*) FILTER (WHERE attendance='present') AS present,
+              count(*) FILTER (WHERE attendance='excused') AS excused,
+              count(*) FILTER (WHERE attendance='absent')  AS absent,
+              round(avg(behavior)      FILTER (WHERE attendance='present')::numeric,2)::float8 AS behavior,
+              round(avg(participation) FILTER (WHERE attendance='present')::numeric,2)::float8 AS participation,
+              round(avg(homework)      FILTER (WHERE attendance='present')::numeric,2)::float8 AS homework
+       FROM evaluations WHERE student_id = $1 AND ($2::date IS NULL OR eval_date >= $2)
+         AND ($3::date IS NULL OR eval_date <= $3)`, [id, f.from || null, f.to || null]),
+    // اختبارات صف الطالبة وشعبتها فقط — لا عناوين اختبارات من صفوف أخرى
+    q(`SELECT t.id, t.title, t.kind, t.max_score::float8 AS max_score, t.test_date, r.score::float8 AS score, r.note
+       FROM tests t LEFT JOIN results r ON r.test_id = t.id AND r.student_id = $1
+       WHERE t.grade = (SELECT grade FROM students WHERE id = $1)
+         AND t.section = (SELECT section FROM students WHERE id = $1)
+         AND ($2::date IS NULL OR t.test_date >= $2) AND ($3::date IS NULL OR t.test_date <= $3)
+       ORDER BY t.test_date DESC`, [id, f.from || null, f.to || null]),
+    q(`SELECT w.id, w.title, w.description, w.work_date, COALESCE(t.done, false) AS done,
+              (SELECT id FROM files fi WHERE fi.worksheet_id = w.id LIMIT 1) AS file_id
+       FROM worksheets w LEFT JOIN worksheet_targets t ON t.worksheet_id = w.id AND t.student_id = $1
+       WHERE w.grade = (SELECT grade FROM students WHERE id = $1)
+         AND w.section = (SELECT section FROM students WHERE id = $1)
+         AND (NOT EXISTS (SELECT 1 FROM worksheet_targets x WHERE x.worksheet_id = w.id) OR t.student_id IS NOT NULL)
+       ORDER BY w.work_date DESC`, [id]),
+    q(`SELECT p.*, COALESCE(json_agg(json_build_object('id', fu.id, 'follow_date', fu.follow_date, 'note', fu.note)
+              ORDER BY fu.follow_date) FILTER (WHERE fu.id IS NOT NULL), '[]') AS followups
+       FROM plans p LEFT JOIN plan_followups fu ON fu.plan_id = p.id
+       WHERE p.student_id = $1 GROUP BY p.id ORDER BY p.status, p.to_date DESC NULLS LAST`, [id]),
+    q(`SELECT sk.id, sk.name, sk.description, l.level, l.note
+       FROM skills sk LEFT JOIN skill_levels l ON l.skill_id = sk.id AND l.student_id = $1 ORDER BY sk.name`, [id]),
+    q('SELECT week_start, week_label, reason FROM weekly_star WHERE student_id = $1 ORDER BY week_start DESC', [id])
+  ]);
+  if (!st.rows[0]) return null;
+  return {
+    student: st.rows[0],
+    evaluations: evals.rows,
+    counts: counts.rows[0],
+    tests: tests.rows,
+    worksheets: worksheets.rows,
+    plans: plans.rows,
+    skills: skills.rows,
+    stars: stars.rows
+  };
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/settings.ts>>>
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { UpFile } from '../middleware/upload';
+import * as filesSvc from './files';
+
+export const DEFAULTS: Record<string, any> = {
+  schoolName: 'اسم المدرسة',
+  eduAdmin: 'الإدارة العامة للتعليم',
+  principal: 'أ. بدور الجارد',
+  teacher: 'أ. مها الحمادي',
+  grades: ['الرابع', 'الخامس', 'السادس'],
+  classes: ['أ', 'ب'],
+  scale: { max: 5, labels: { '5': 'ممتاز', '4': 'جيد جدًا', '3': 'جيد', '2': 'يحتاج إلى تحسين', '1': 'يحتاج إلى متابعة' } },
+  alerts: { lowStreak: 3, lowThreshold: 2, absenceDays: 3, noEvalDays: 14 },
+  info: { about: '', goals: '', bio: '' },
+  logoSchool: null,
+  logoMoe: null
+};
+
+export async function getAll() {
+  const { rows } = await q<{ key: string; value: any }>('SELECT key, value FROM settings');
+  const out: Record<string, any> = { ...DEFAULTS };
+  for (const r of rows) out[r.key] = r.value;
+  return out;
+}
+
+export async function put(patch: Record<string, any>) {
+  for (const [k, v] of Object.entries(patch)) {
+    if (!(k in DEFAULTS)) throw new HttpError(400, 'مفتاح إعدادات غير معروف: ' + k);
+    await q(
+      'INSERT INTO settings(key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
+      [k, JSON.stringify(v ?? null)]);
+  }
+  return getAll();
+}
+
+export async function setLogo(file: UpFile, which: 'school' | 'moe', userId: number) {
+  const key = which === 'moe' ? 'logoMoe' : 'logoSchool';
+  // الشعار القديم يُحذف فعلياً من القرص عند الاستبدال
+  const cur = await q('SELECT value FROM settings WHERE key = $1', [key]);
+  const oldId = cur.rows[0]?.value?.file_id;
+  if (oldId) {
+    const old = await q("DELETE FROM files WHERE id = $1 AND kind = 'logo' RETURNING stored_name", [oldId]);
+    if (old.rows[0]) filesSvc.unlinkSafe(old.rows[0].stored_name);
+  }
+  const reg = await filesSvc.register({
+    stored_name: file.filename, original_name: file.originalname, mime: file.mimetype, size: file.size,
+    kind: 'logo', student_id: null, worksheet_id: null, achievement_id: null, uploaded_by: userId
+  });
+  return put({ [key]: { file_id: reg.id } });
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/services/users.ts>>>
+import { q } from '../database/pool';
+import { HttpError } from '../middleware/errors';
+import { AuthUser } from '../middleware/auth';
+import { hashPassword } from './auth';
+
+export async function list(user: AuthUser, fIn: { role?: string; student_id?: number }) {
+  // المعلمة ترى حسابات الطالبات فقط؛ الإدارة النظام ترى الجميع (وفق مصفوفة الصلاحيات)
+  const f = user.role === 'admin' ? fIn : { ...fIn, role: 'student' };
+  const { rows } = await q(
+    `SELECT u.id, u.username, u.role, u.active, u.student_id, s.name AS student_name, s.code AS student_code
+     FROM users u LEFT JOIN students s ON s.id = u.student_id
+     WHERE ($1::text IS NULL OR u.role = $1) AND ($2::int IS NULL OR u.student_id = $2)
+     ORDER BY u.id`, [f.role || null, f.student_id ?? null]);
+  return rows; // كلمات المرور لا تُعاد أبداً
+}
+
+export async function create(actor: AuthUser, b: any) {
+  const role = b.role ?? 'student';
+  const username = String(b.username ?? '').trim().toLowerCase();
+  if (!username) throw new HttpError(400, 'اسم المستخدم مطلوب');
+  if (!b.password || String(b.password).length < 6) throw new HttpError(400, 'كلمة المرور يجب ألا تقل عن 6 أحرف');
+  // المعلمة تنشئ حسابات طالبات فقط؛ إنشاء حسابات معلمات/إدارة حكر على الإدارة النظام — لا تسجيل ذاتي إطلاقاً
+  if (actor.role !== 'admin' && role !== 'student') throw new HttpError(403, 'إنشاء حسابات المعلمات/الإدارة متاح للإدارة النظام فقط');
+  let studentId: number | null = null;
+  if (role === 'student') {
+    studentId = Number(b.student_id);
+    if (!studentId) throw new HttpError(400, 'يجب ربط الحساب بالطالبة عبر رمزها الثابت');
+    const s = await q('SELECT id FROM students WHERE id = $1', [studentId]);
+    if (!s.rowCount) throw new HttpError(404, 'الطالبة غير موجودة');
+    const taken = await q('SELECT 1 FROM users WHERE student_id = $1', [studentId]);
+    if (taken.rowCount) throw new HttpError(409, 'لهذه الطالبة حساب بالفعل');
+  }
+  try {
+    const { rows } = await q(
+      'INSERT INTO users(username, password_hash, role, student_id) VALUES ($1,$2,$3,$4) RETURNING id, username, role, active, student_id',
+      [username, await hashPassword(String(b.password)), role, studentId]);
+    return rows[0];
+  } catch (e: any) {
+    if (e.code === '23505') throw new HttpError(409, 'اسم المستخدم مستخدم مسبقاً');
+    throw e;
+  }
+}
+
+export async function update(actor: AuthUser, id: number, b: any) {
+  const { rows } = await q('SELECT * FROM users WHERE id = $1', [id]);
+  const u = rows[0];
+  if (!u) throw new HttpError(404, 'المستخدم غير موجود');
+  if (actor.role !== 'admin' && u.role !== 'student') throw new HttpError(403, 'غير مصرح');
+  // student_id غير قابل للتعديل عمداً: الربط بالرمز الثابت لا يتغير
+  try {
+    if (b.username) {
+      const un = String(b.username).trim().toLowerCase();
+      await q('UPDATE users SET username = $2 WHERE id = $1', [id, un]);
+    }
+    if (b.active !== undefined) await q('UPDATE users SET active = $2 WHERE id = $1', [id, !!b.active]);
+    if (b.password) {
+      if (String(b.password).length < 6) throw new HttpError(400, 'كلمة المرور قصيرة جداً');
+      await q('UPDATE users SET password_hash = $2, token_version = token_version + 1 WHERE id = $1',
+        [id, await hashPassword(String(b.password))]);
+    }
+  } catch (e: any) {
+    if (e.code === '23505') throw new HttpError(409, 'اسم المستخدم مستخدم مسبقاً');
+    throw e;
+  }
+  const { rows: out } = await q('SELECT id, username, role, active, student_id FROM users WHERE id = $1', [id]);
+  return out[0];
+}
+
+export async function remove(id: number) {
+  const { rows } = await q('DELETE FROM users WHERE id = $1 RETURNING id, username', [id]);
+  if (!rows[0]) throw new HttpError(404, 'المستخدم غير موجود');
+  return rows[0];
+}
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/auth.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/auth';
+import { setAuthCookie, clearAuthCookie } from '../middleware/auth';
+import { audit } from '../services/audit';
+
+export const login = wrap(async (req, res) => {
+  try {
+    const r = await svc.login(req.body.username, req.body.password);
+    setAuthCookie(res, r.token);
+    await audit(req, 'login', 'user', r.user.id, { username: r.user.username });
+    res.json({ user: r.user });
+  } catch (e) {
+    await audit(req, 'login_fail', 'user', null, { username: String(req.body?.username ?? '') });
+    throw e;
+  }
+});
+export const logout = wrap(async (req, res) => { clearAuthCookie(res); res.json({ ok: true }); });
+export const me = wrap(async (req, res) => res.json({ user: req.user }));
+export const changePassword = wrap(async (req, res) => {
+  await svc.changePassword(req.user!.id, req.body.new, req.body.current, true);
+  await audit(req, 'password.change', 'user', req.user!.id, {});
+  res.json({ ok: true }); // كل الجلسات الأخرى بطلت تلقائياً (token_version)
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/users.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/users';
+import { audit } from '../services/audit';
+
+export const list = wrap(async (req, res) => res.json(await svc.list(req.user!, req.query as any)));
+export const create = wrap(async (req, res) => {
+  const row = await svc.create(req.user!, req.body);
+  await audit(req, 'account.create', 'user', row.id, { username: row.username, role: row.role, student_id: row.student_id });
+  res.status(201).json(row);
+});
+export const update = wrap(async (req, res) => {
+  const row = await svc.update(req.user!, +req.params.id, req.body);
+  await audit(req, 'account.update', 'user', row.id, { active: row.active, password_reset: !!req.body.password });
+  res.json(row);
+});
+export const remove = wrap(async (req, res) => {
+  const row = await svc.remove(+req.params.id);
+  await audit(req, 'account.delete', 'user', row.id, { username: row.username });
+  res.status(204).end();
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/students.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/students';
+import { audit } from '../services/audit';
+
+export const list = wrap(async (req, res) => res.json(await svc.list(req.query as any)));
+export const get = wrap(async (req, res) => res.json(await svc.get(req.user!, +req.params.id)));
+export const create = wrap(async (req, res) => {
+  const row = await svc.create(req.body, req.user!.id);
+  await audit(req, 'student.create', 'student', row.id, { name: row.name, code: row.code });
+  res.status(201).json(row);
+});
+export const update = wrap(async (req, res) => {
+  const row = await svc.update(+req.params.id, req.body);
+  await audit(req, 'student.update', 'student', row.id, { name: row.name, grade: row.grade, section: row.section });
+  res.json(row);
+});
+export const remove = wrap(async (req, res) => {
+  const row = await svc.remove(+req.params.id);
+  await audit(req, 'student.delete', 'student', row.id, { name: row.name });
+  res.status(204).end();
+});
+export const importRows = wrap(async (req, res) => {
+  const r = await svc.importRows(req.body.rows);
+  await audit(req, 'students.import', 'student', null, r);
+  res.json(r);
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/evaluations.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/evaluations';
+import { audit } from '../services/audit';
+
+export const list = wrap(async (req, res) => res.json(await svc.list(req.user!, req.query as any)));
+export const create = wrap(async (req, res) => {
+  const row = await svc.create(req.user!, req.body);
+  await audit(req, 'evaluation.create', 'evaluation', row.id, { student_id: row.student_id, eval_date: row.eval_date });
+  res.status(201).json(row);
+});
+export const remove = wrap(async (req, res) => {
+  const row = await svc.remove(+req.params.id);
+  await audit(req, 'evaluation.delete', 'evaluation', row.id, { student_id: row.student_id });
+  res.status(204).end();
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/worksheets.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/worksheets';
+import { audit } from '../services/audit';
+
+export const list = wrap(async (req, res) => res.json(await svc.list(req.user!, req.query as any)));
+export const create = wrap(async (req, res) => {
+  const row = await svc.create(req.user!, req.body, (req as any).file);
+  await audit(req, 'worksheet.create', 'worksheet', row.id, { title: row.title, grade: row.grade, section: row.section });
+  res.status(201).json(row);
+});
+export const setStatus = wrap(async (req, res) => res.json(await svc.setStatus(+req.params.id, Number(req.body.student_id), !!req.body.done)));
+export const remove = wrap(async (req, res) => { await svc.remove(+req.params.id); res.status(204).end(); });
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/tests.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/tests';
+import { audit } from '../services/audit';
+
+export const list = wrap(async (req, res) => res.json(await svc.list(req.user!, req.query as any)));
+export const create = wrap(async (req, res) => {
+  const row = await svc.create(req.user!, req.body);
+  await audit(req, 'test.create', 'test', row.id, { title: row.title, kind: row.kind });
+  res.status(201).json(row);
+});
+export const saveResults = wrap(async (req, res) => {
+  const r = await svc.saveResults(req.user!, +req.params.id, req.body.rows);
+  await audit(req, 'test.results', 'test', +req.params.id, { saved: r.saved });
+  res.json(r);
+});
+export const remove = wrap(async (req, res) => { await svc.remove(+req.params.id); res.status(204).end(); });
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/plans.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/plans';
+
+export const list = wrap(async (req, res) => res.json(await svc.list(req.user!, req.query.student_id ? +req.query.student_id : undefined)));
+export const create = wrap(async (req, res) => res.status(201).json(await svc.create(req.user!, req.body)));
+export const update = wrap(async (req, res) => res.json(await svc.update(+req.params.id, req.body)));
+export const addFollowup = wrap(async (req, res) => res.status(201).json(await svc.addFollowup(req.user!, +req.params.id, req.body)));
+export const remove = wrap(async (req, res) => { await svc.remove(+req.params.id); res.status(204).end(); });
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/skills.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/skills';
+
+export const list = wrap(async (req, res) => res.json(await svc.list(req.user!, req.query.student_id ? +req.query.student_id : undefined)));
+export const create = wrap(async (req, res) => res.status(201).json(await svc.create(req.user!, req.body)));
+export const setLevels = wrap(async (req, res) => res.json(await svc.setLevels(req.user!, +req.params.id, req.body.rows)));
+export const remove = wrap(async (req, res) => { await svc.remove(+req.params.id); res.status(204).end(); });
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/messages.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/messages';
+
+export const threads = wrap(async (req, res) => res.json(await svc.threads()));
+export const thread = wrap(async (req, res) => res.json(await svc.thread(req.user!, +req.params.studentId)));
+export const send = wrap(async (req, res) => res.status(201).json(await svc.send(req.user!, Number(req.body.student_id), req.body.body)));
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/star.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/star';
+
+export const current = wrap(async (req, res) => res.json(await svc.current()));
+export const list = wrap(async (req, res) => res.json(await svc.list((req.query as any).from, (req.query as any).to)));
+export const put = wrap(async (req, res) => res.json(await svc.put(req.user!, req.body)));
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/achievements.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/achievements';
+import { audit } from '../services/audit';
+
+export const list = wrap(async (req, res) => res.json(await svc.list(req.user!)));
+export const create = wrap(async (req, res) => {
+  const row = await svc.create(req.user!, req.body, (req as any).files ?? []);
+  await audit(req, 'achievement.create', 'achievement', row.id, { title: row.title });
+  res.status(201).json(row);
+});
+export const update = wrap(async (req, res) => res.json(await svc.update(+req.params.id, req.body)));
+export const remove = wrap(async (req, res) => { await svc.remove(+req.params.id); res.status(204).end(); });
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/files.ts>>>
+import path from 'path';
+import fs from 'fs';
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/files';
+import { audit } from '../services/audit';
+import { env } from '../config';
+import { HttpError } from '../middleware/errors';
+
+export const download = wrap(async (req, res) => {
+  const f = await svc.getForDownload(+req.params.id);
+  // 404 بدل 403 عند عدم الملكية: لا نكشف حتى وجود الملف لمن يحاول تخمين الروابط
+  if (!f || !svc.accessible(req.user!, f)) throw new HttpError(404, 'الملف غير موجود');
+  const abs = path.join(env.uploadDirAbs, f.stored_name);
+  if (!fs.existsSync(abs)) throw new HttpError(404, 'الملف غير موجود');
+  await audit(req, 'file.download', 'file', f.id, { kind: f.kind });
+  res.download(abs, f.original_name);
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/reports.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/reports';
+
+export const summary = wrap(async (req, res) => res.json(await svc.summary(req.query as any)));
+export const compare = wrap(async (req, res) => res.json(await svc.compare(req.query as any)));
+export const student = wrap(async (req, res) => {
+  const r = await svc.studentReport(req.user!, +req.params.id, req.query as any);
+  if (!r) return res.status(404).json({ error: 'الطالبة غير موجودة' });
+  res.json(r);
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/settings.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/settings';
+import { HttpError } from '../middleware/errors';
+
+export const get = wrap(async (_req, res) => res.json(await svc.getAll()));
+export const put = wrap(async (req, res) => res.json(await svc.put(req.body)));
+export const logo = wrap(async (req, res) => {
+  const f = (req as any).file;
+  if (!f) throw new HttpError(400, 'اختاري ملف الشعار');
+  res.json(await svc.setLogo(f, (req.body.which === 'moe' ? 'moe' : 'school'), req.user!.id));
+});
+//<<<END>>>
+
+//<<<FILE: backend/src/controllers/audit.ts>>>
+import { wrap } from '../middleware/errors';
+import * as svc from '../services/audit';
+
+export const list = wrap(async (req, res) =>
+  res.json(await svc.list({ limit: req.query.limit ? +req.query.limit : undefined, user_id: req.query.user_id ? +req.query.user_id : undefined })));
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/auth.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/auth';
+import { requireAuth } from '../middleware/auth';
+
+const r = Router();
+r.post('/login', c.login);
+r.post('/logout', c.logout);
+r.get('/me', requireAuth, c.me);
+r.post('/change-password', requireAuth, c.changePassword);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/users.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/users';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', requireRole('teacher', 'admin'), c.list);
+r.post('/', requireRole('teacher', 'admin'), c.create);       // المعلمة: حسابات طالبات فقط (يُفرض داخل الخدمة)
+r.patch('/:id', requireRole('teacher', 'admin'), c.update);    // المعلمة: حسابات طالبات فقط
+r.delete('/:id', requireRole('admin'), c.remove);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/students.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/students';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', requireRole('teacher', 'admin'), c.list);
+r.get('/:id', requireRole('teacher', 'admin', 'student'), c.get); // الطالبة: نفسها فقط (يُفرض داخل الخدمة)
+r.post('/', requireRole('teacher'), c.create);
+r.post('/import', requireRole('teacher'), c.importRows);
+r.patch('/:id', requireRole('teacher'), c.update);
+r.delete('/:id', requireRole('teacher'), c.remove);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/evaluations.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/evaluations';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', requireRole('teacher', 'admin', 'student'), c.list);
+r.post('/', requireRole('teacher'), c.create);
+r.delete('/:id', requireRole('teacher'), c.remove);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/worksheets.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/worksheets';
+import { requireAuth, requireRole } from '../middleware/auth';
+import { upload } from '../middleware/upload';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', requireRole('teacher', 'admin', 'student'), c.list);
+r.post('/', requireRole('teacher'), upload.single('file'), c.create);
+r.patch('/:id/status', requireRole('teacher'), c.setStatus);
+r.delete('/:id', requireRole('teacher'), c.remove);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/tests.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/tests';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', requireRole('teacher', 'admin', 'student'), c.list);
+r.post('/', requireRole('teacher'), c.create);
+r.put('/:id/results', requireRole('teacher'), c.saveResults);
+r.delete('/:id', requireRole('teacher'), c.remove);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/plans.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/plans';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', requireRole('teacher', 'admin', 'student'), c.list);
+r.post('/', requireRole('teacher'), c.create);
+r.patch('/:id', requireRole('teacher'), c.update);
+r.post('/:id/followups', requireRole('teacher'), c.addFollowup);
+r.delete('/:id', requireRole('teacher'), c.remove);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/skills.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/skills';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', requireRole('teacher', 'admin', 'student'), c.list);
+r.post('/', requireRole('teacher'), c.create);
+r.put('/:id/levels', requireRole('teacher'), c.setLevels);
+r.delete('/:id', requireRole('teacher'), c.remove);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/messages.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/messages';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/threads', requireRole('teacher', 'admin'), c.threads);
+r.get('/:studentId', requireRole('teacher', 'admin', 'student'), c.thread); // الطالبة: محادثتها فقط
+r.post('/', requireRole('teacher', 'admin', 'student'), c.send);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/star.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/star';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/current', requireRole('teacher', 'admin', 'student'), c.current);
+r.get('/', requireRole('teacher', 'admin', 'student'), c.list);
+r.put('/', requireRole('teacher'), c.put);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/achievements.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/achievements';
+import { requireAuth, requireRole } from '../middleware/auth';
+import { upload } from '../middleware/upload';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', requireRole('teacher', 'admin', 'student'), c.list); // الطالبة ترى المعلن فقط
+r.post('/', requireRole('teacher'), upload.array('files', 10), c.create);
+r.patch('/:id', requireRole('teacher'), c.update);
+r.delete('/:id', requireRole('teacher'), c.remove);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/files.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/files';
+import { requireAuth } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/:id', c.download); // فحص الملكية داخل الخدمة لكل من يطلب
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/reports.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/reports';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/summary', requireRole('teacher', 'admin'), c.summary);
+r.get('/compare', requireRole('teacher', 'admin'), c.compare);
+r.get('/student/:id', requireRole('teacher', 'admin', 'student'), c.student); // الطالبة: تقريرها فقط
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/settings.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/settings';
+import { requireAuth, requireRole } from '../middleware/auth';
+import { upload } from '../middleware/upload';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', c.get);                                   // التسميات والشعارات يحتاجها الجميع
+r.put('/', requireRole('teacher'), c.put);
+r.post('/logo', requireRole('teacher'), upload.single('logo'), c.logo);
+export default r;
+//<<<END>>>
+
+//<<<FILE: backend/src/routes/audit.ts>>>
+import { Router } from 'express';
+import * as c from '../controllers/audit';
+import { requireAuth, requireRole } from '../middleware/auth';
+
+const r = Router();
+r.use(requireAuth);
+r.get('/', requireRole('admin'), c.list); // سجل التدقيق للإدارة النظام
+export default r;
+//<<<END>>>

@@ -1,0 +1,17 @@
+{
+  "name": "lughati",
+  "private": true,
+  "version": "2.0.0",
+  "workspaces": ["backend", "frontend"],
+  "scripts": {
+    "db:create": "npm run db:create -w backend",
+    "migrate": "npm run migrate -w backend",
+    "seed": "npm run seed -w backend",
+    "import:students": "npm run import:students -w backend",
+    "dev:server": "npm run dev -w backend",
+    "dev:web": "npm run dev -w frontend",
+    "build": "npm run build -w frontend && npm run build -w backend",
+    "start": "npm run start -w backend",
+    "test": "npm run test -w backend"
+  }
+}

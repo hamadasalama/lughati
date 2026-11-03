@@ -1,0 +1,628 @@
+# pack-1.txt — ملفات الجذر + قاعدة البيانات + الاختبارات (11 ملفاً)
+# يقرأه unpack.mjs وينشئ كل ملف بين علامتي FILE و END باسمه ومساره كما هما.
+
+//<<<FILE: .env.example>>>
+# ── انسخي هذا الملف إلى .env وغيّري القيم — .env لا يُرفع أبداً للمستودع ──
+NODE_ENV=development
+PORT=4000
+
+# قاعدة البيانات: أنشئي كلمة مرور قوية للمستخدم postgres أو مستخدم مخصص
+DATABASE_URL=postgresql://postgres:كلمة_المرور@localhost:5432/lughati
+
+# سرّ توقيع الجلسات — نص عشوائي طويل (مثلاً 64 حرفاً). لا يُشارك مع أي أحد
+JWT_SECRET=غيّري_هذه_القيمة_إلى_نص_عشوائي_طويل
+
+# أصل الواجهة (CORS)
+CORS_ORIGIN=http://localhost:5173
+
+# الملفات المرفوعة
+UPLOAD_DIR=uploads
+MAX_UPLOAD_MB=6
+
+# حساب المعلمة الأول (يُنشأ مرة واحدة عبر npm run seed)
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=lughati1234
+
+# قاعدة اختبار منفصلة للاختبارات (اختياري — لهذا الافتراضي)
+TEST_DATABASE_URL=postgresql://postgres:كلمة_المرور@localhost:5432/lughati_test
+//<<<END>>>
+
+//<<<FILE: .gitignore>>>
+node_modules/
+dist/
+uploads/
+uploads-test/
+.env
+*.log
+//<<<END>>>
+
+//<<<FILE: README.md>>>
+# منصة تقييم طالبات مادة لغتي — نسخة Full-Stack
+
+تطبيق حقيقي ثلاثي الطبقات: واجهة React + TypeScript، خادم Node.js/Express + TypeScript،
+قاعدة PostgreSQL. جميع الصلاحيات تُفرض على الخادم، ولا توجد أي بيانات أو مفاتيح سرية في كود الواجهة.
+
+## المتطلبات
+- Node.js 20 أو أحدث
+- PostgreSQL 14 أو أحدث (على Windows: مثبّت من postgresql.org يكفي، والتشغيل من pgAdmin أو الخدمة التلقائية)
+
+## التشغيل المحلي (من المرة الأولى)
+1. انسخي `.env.example` إلى `.env` وعدّلي `DATABASE_URL` و`JWT_SECRET`.
+2. إنشاء قاعدة البيانات والجداول والحساب الأول:
+   ```
+   cd backend
+   npm install
+   npm run db:create     # ينشئ قاعدة lughati إن لم توجد
+   npm run migrate       # ينشئ الجداول والفهارس
+   npm run seed          # الإعدادات الافتراضية + حساب المعلمة admin
+   ```
+3. نقل أسماء الطالبات (إحدى الطريقتين):
+   - الصقي الأسماء في `database/seeds/students.csv` (سطر: الاسم،الصف،الشعبة) ثم:
+     `npm run import:students -- ../database/seeds/students.csv`
+   - أو من الواجهة: الطالبات ← «استيراد سريع» (الصقي مباشرة من تصدير CSV في النسخة السابقة).
+4. تشغيل الخادم: `npm run dev`  (منفذ 4000)
+5. تشغيل الواجهة (نافذة ثانية):
+   ```
+   cd ../frontend
+   npm install
+   npm run dev          # منفذ 5173 — افتحي http://localhost:5173
+   ```
+6. الدخول الأول: `admin` / `lughati1234` ← **غيّري كلمة المرور فوراً من الإعدادات**.
+
+## الاختبارات (تكامل حقيقية ضد قاعدة فعلية)
+1. أنشئي قاعدة اختبار مرة واحدة (نفس خطوات db:create مع تغيير الاسم إلى lughati_test في TEST_DATABASE_URL).
+2. من مجلد `backend`: `npm test` — تشمل مصادقة، صلاحيات (طالبة × بيانات طالبة أخرى = منع)، تراكمية التقييم، قيود الحضور، نجم الأسبوع، الحسابات، سجل التدقيق.
+
+## الإنتاج
+- `cd frontend && npm run build` ثم `cd ../backend && npm run build && npm start`
+  — الخادم يقدّم الواجهة المبنية من نفس المنفذ.
+- استخدمي https (عبر nginx مثلاً) ليصبح كوكي الجلسة `Secure`.
+- نسخ احتياطي يومي: `pg_dump lughati > backup.sql` (جدوله عبر Task Scheduler).
+- متغيرات `.env` تبقى على الخادم فقط، ولا تُرفع لأي مستودع.
+
+## توثيق الـAPI (كلها تحت /api، الجلسة بكوكي httpOnly)
+| المسار | الطريقة | الأدوار المسموحة | الوظيفة |
+|---|---|---|---|
+| /auth/login | POST | عام | دخول وإصدار جلسة |
+| /auth/logout | POST | مصادق | إنهاء الجلسة |
+| /auth/me | GET | مصادق | هوية الجلسة (الدور من قاعدة البيانات) |
+| /auth/change-password | POST | مصادق | تغيير كلمة المرور + إبطال الجلسات الأخرى |
+| /users | GET/POST/PATCH | teacher (طالبات فقط)، admin (الكل) | إدارة الحسابات — لا تسجيل ذاتي |
+| /users/:id | DELETE | admin | حذف حساب |
+| /students | GET | teacher, admin | قائمة الطالبات |
+| /students/:id | GET | teacher, admin، أو الطالبة نفسها فقط | بيانات طالبة |
+| /students, /students/import | POST | teacher | إضافة/استيراد جماعي |
+| /students/:id | PATCH/DELETE | teacher | تعديل/حذف (يُسجَّل في التدقيق) |
+| /evaluations | GET | teacher, admin، أو الطالبة نفسها | التقييمات (فلترة from/to) |
+| /evaluations | POST | teacher | تقييم جديد (تراكمي، الحضور مستقل) |
+| /evaluations/:id | DELETE | teacher | حذف تقييم (يُسجَّل) |
+| /worksheets | GET/POST | GET: الجميع (الطالبة ترى ورقاتها فقط)، POST: teacher | أوراق العمل + مرفق |
+| /worksheets/:id/status | PATCH | teacher | تسجيل إنجاز ورقة لطالبة |
+| /tests | GET/POST | GET: الجميع (الطالبة ترى نتائجها)، POST: teacher | اختبارات + نافس (kind) |
+| /tests/:id/results | PUT | teacher | رصد/تعديل النتائج |
+| /plans | GET/POST/PATCH/DELETE | GET: الجميع (خاصتها)، الباقي teacher | الخطط العلاجية |
+| /plans/:id/followups | POST | teacher | متابعة خطة |
+| /skills | GET/POST/DELETE | GET: الجميع، الباقي teacher | المهارات ومستويات الإتقان |
+| /skills/:id/levels | PUT | teacher | رصد مستويات |
+| /messages/threads | GET | teacher, admin | كل المحادثات + غير المقروء |
+| /messages/:studentId | GET | teacher، أو الطالبة نفسها | محادثة (تعليم مقروء) |
+| /messages | POST | teacher أو الطالبة لنفسها | إرسال رسالة |
+| /star/current, /star | GET | الجميع | أميرتي هذا الأسبوع |
+| /star | PUT | teacher | اختيار نجمة الأسبوع (upsert) |
+| /achievements | GET/POST/PATCH/DELETE | GET: الجميع (الطالبة: المعلن فقط)، الباقي teacher | إنجازات المادة + مرفقات |
+| /files/:id | GET | حسب الملكية (يُفحص في الخادم) | تنزيل ملف — ملف طالبة أخرى = 404 |
+| /reports/summary, /compare | GET | teacher, admin | ملخص/مقارنة فترات (الاتجاه يحتاج ≥4 تقييمات) |
+| /reports/student/:id | GET | teacher, admin، أو الطالبة نفسها | تقرير شامل لطالبة |
+| /settings | GET/PUT | GET: مصادق، PUT: teacher | الإعدادات والتسميات |
+| /settings/logo | POST | teacher | رفع شعار المدرسة/الوزارة |
+| /audit | GET | admin | سجل العمليات الحساسة |
+| /health | GET | عام | فحص فعلي للاتصال بالقاعدة |
+//<<<END>>>
+
+//<<<FILE: database/migrations/001_init.sql>>>
+-- مخطط منصة لغتي الكامل: جداول، علاقات، قيود، فهارس
+CREATE TABLE students (
+  id          serial PRIMARY KEY,
+  code        varchar(30)  NOT NULL UNIQUE,          -- الرمز الثابت الذي يُربط به حساب الطالبة ولا يتغير
+  name        varchar(120) NOT NULL,
+  grade       varchar(20)  NOT NULL,
+  section     varchar(10)  NOT NULL,                 -- الشعبة (class محجوزة في SQL)
+  notes       text,
+  active      boolean      NOT NULL DEFAULT true,
+  created_at  timestamptz  NOT NULL DEFAULT now()
+);
+
+CREATE TABLE users (
+  id            serial PRIMARY KEY,
+  username      varchar(60)  NOT NULL UNIQUE,
+  password_hash varchar(200) NOT NULL,                 -- bcrypt فقط، ولا تُعاد للواجهة أبداً
+  role          varchar(10)  NOT NULL CHECK (role IN ('teacher','student','admin')),
+  student_id    integer      UNIQUE REFERENCES students(id) ON DELETE CASCADE,
+  active        boolean      NOT NULL DEFAULT true,
+  token_version integer      NOT NULL DEFAULT 0,       -- يُرفع عند تغيير كلمة المرور فتُبطَل كل الجلسات القديمة
+  created_at    timestamptz  NOT NULL DEFAULT now(),
+  CONSTRAINT student_role_needs_student CHECK ((role = 'student') = (student_id IS NOT NULL))
+);
+
+-- التقييم تراكمي: لا يوجد UNIQUE على (student_id, eval_date) عمداً
+CREATE TABLE evaluations (
+  id            bigserial PRIMARY KEY,
+  student_id    integer   NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  eval_date     date      NOT NULL,
+  attendance    varchar(8) NOT NULL CHECK (attendance IN ('present','excused','absent')),
+  behavior      smallint CHECK (behavior BETWEEN 1 AND 5),
+  participation smallint CHECK (participation BETWEEN 1 AND 5),
+  homework      smallint CHECK (homework BETWEEN 1 AND 5),
+  notes         text,
+  demo          boolean   NOT NULL DEFAULT false,
+  created_by    integer   REFERENCES users(id) ON DELETE SET NULL,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT absent_has_no_scores CHECK (
+    attendance = 'present' OR (behavior IS NULL AND participation IS NULL AND homework IS NULL)
+  )
+);
+
+CREATE TABLE worksheets (
+  id          serial PRIMARY KEY,
+  title       varchar(160) NOT NULL,
+  description text,
+  grade       varchar(20) NOT NULL,
+  section     varchar(10) NOT NULL,
+  work_date   date NOT NULL DEFAULT CURRENT_DATE,
+  demo        boolean NOT NULL DEFAULT false,
+  created_by  integer REFERENCES users(id) ON DELETE SET NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+-- لا صفوف targets = الورقة لجميع طالبات الصف؛ وجود صف = معيّنة لطالبة بعينها
+CREATE TABLE worksheet_targets (
+  worksheet_id integer NOT NULL REFERENCES worksheets(id) ON DELETE CASCADE,
+  student_id   integer NOT NULL REFERENCES students(id)  ON DELETE CASCADE,
+  done         boolean NOT NULL DEFAULT false,
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (worksheet_id, student_id)
+);
+
+CREATE TABLE tests (
+  id         serial PRIMARY KEY,
+  title      varchar(160) NOT NULL,
+  kind       varchar(8) NOT NULL CHECK (kind IN ('test','nafis')),  -- نافس ضمن نفس الجدول
+  max_score  numeric(5,2) NOT NULL DEFAULT 10 CHECK (max_score > 0),
+  test_date  date NOT NULL DEFAULT CURRENT_DATE,
+  grade      varchar(20) NOT NULL,
+  section    varchar(10) NOT NULL,
+  demo       boolean NOT NULL DEFAULT false,
+  created_by integer REFERENCES users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE results (
+  id         bigserial PRIMARY KEY,
+  test_id    integer NOT NULL REFERENCES tests(id)    ON DELETE CASCADE,
+  student_id integer NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  score      numeric(5,2) NOT NULL CHECK (score >= 0),
+  note       text,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (test_id, student_id)
+);
+
+CREATE TABLE plans (
+  id         serial PRIMARY KEY,
+  student_id integer NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  title      varchar(160) NOT NULL,
+  goal       text,
+  actions    text,
+  from_date  date,
+  to_date    date,
+  status     varchar(8) NOT NULL DEFAULT 'active' CHECK (status IN ('active','done')),
+  demo       boolean NOT NULL DEFAULT false,
+  created_by integer REFERENCES users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE plan_followups (
+  id          bigserial PRIMARY KEY,
+  plan_id     integer NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  follow_date date NOT NULL DEFAULT CURRENT_DATE,
+  note        text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE skills (
+  id          serial PRIMARY KEY,
+  name        varchar(120) NOT NULL UNIQUE,
+  description text,
+  demo        boolean NOT NULL DEFAULT false,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE skill_levels (
+  id         bigserial PRIMARY KEY,
+  skill_id   integer NOT NULL REFERENCES skills(id)   ON DELETE CASCADE,
+  student_id integer NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  level      smallint NOT NULL CHECK (level BETWEEN 1 AND 5),
+  note       text,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (skill_id, student_id)
+);
+
+CREATE TABLE messages (
+  id           bigserial PRIMARY KEY,
+  student_id   integer NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  sender       varchar(8) NOT NULL CHECK (sender IN ('teacher','student')),
+  body         text NOT NULL,
+  sent_at      timestamptz NOT NULL DEFAULT now(),
+  seen_teacher boolean NOT NULL DEFAULT false,
+  seen_student boolean NOT NULL DEFAULT false
+);
+
+CREATE TABLE weekly_star (                 -- «أميرتي هذا الأسبوع» (بداية الأسبوع = الأحد)
+  id          serial PRIMARY KEY,
+  week_start  date NOT NULL UNIQUE,
+  week_label  varchar(40) NOT NULL,
+  student_id  integer NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  reason      text,
+  demo        boolean NOT NULL DEFAULT false,
+  created_by  integer REFERENCES users(id) ON DELETE SET NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE achievements (
+  id          serial PRIMARY KEY,
+  title       varchar(160) NOT NULL,
+  description text,
+  category    varchar(40) NOT NULL DEFAULT 'أخرى',
+  ach_date    date NOT NULL DEFAULT CURRENT_DATE,
+  visible     boolean NOT NULL DEFAULT true,   -- الظهور لبوابة الطالبات
+  demo        boolean NOT NULL DEFAULT false,
+  created_by  integer REFERENCES users(id) ON DELETE SET NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- كل ملف مرفوع يمر من هنا: التنزيل يتم عبر /api/files/:id فقط، مع فحص ملكية في الخادم
+CREATE TABLE files (
+  id             bigserial PRIMARY KEY,
+  stored_name    varchar(120) NOT NULL UNIQUE,   -- اسم عشوائي على القرص (لا يمكن تخمين مسار)
+  original_name  varchar(255) NOT NULL,
+  mime           varchar(120) NOT NULL,
+  size_bytes     integer NOT NULL,
+  kind           varchar(20) NOT NULL,           -- worksheet | achievement | logo
+  student_id     integer REFERENCES students(id)     ON DELETE CASCADE,  -- خاص بطالبة محددة
+  worksheet_id   integer REFERENCES worksheets(id)   ON DELETE CASCADE,
+  achievement_id integer REFERENCES achievements(id) ON DELETE CASCADE,
+  uploaded_by    integer REFERENCES users(id) ON DELETE SET NULL,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE settings (
+  key        varchar(60) PRIMARY KEY,
+  value      jsonb NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE audit_logs (
+  id        bigserial PRIMARY KEY,
+  at        timestamptz NOT NULL DEFAULT now(),
+  user_id   integer,
+  username  varchar(60),
+  role      varchar(10),
+  action    varchar(60) NOT NULL,   -- login / login_fail / evaluation.create / file.download ...
+  entity    varchar(40),
+  entity_id varchar(40),
+  details   jsonb,
+  ip        varchar(60)
+);
+
+CREATE INDEX idx_eval_student      ON evaluations(student_id, eval_date);
+CREATE INDEX idx_eval_date         ON evaluations(eval_date);
+CREATE INDEX idx_targets_student   ON worksheet_targets(student_id);
+CREATE INDEX idx_results_student   ON results(student_id);
+CREATE INDEX idx_plans_student     ON plans(student_id);
+CREATE INDEX idx_levels_student    ON skill_levels(student_id);
+CREATE INDEX idx_messages_student  ON messages(student_id, sent_at);
+CREATE INDEX idx_files_student     ON files(student_id);
+CREATE INDEX idx_audit_at          ON audit_logs(at DESC);
+//<<<END>>>
+
+//<<<FILE: database/seeds/seed.sql>>>
+-- الإعدادات الافتراضية (idempotent) — لا بيانات طالبات ولا درجات ملفقة هنا
+INSERT INTO settings(key, value) VALUES
+ ('schoolName', '"اسم المدرسة"'),
+ ('eduAdmin',   '"الإدارة العامة للتعليم"'),
+ ('principal',  '"أ. بدور الجارد"'),
+ ('teacher',    '"أ. مها الحمادي"'),
+ ('grades',     '["الرابع","الخامس","السادس"]'),
+ ('classes',    '["أ","ب"]'),
+ ('scale',      '{"max":5,"labels":{"5":"ممتاز","4":"جيد جدًا","3":"جيد","2":"يحتاج إلى تحسين","1":"يحتاج إلى متابعة"}}'),
+ ('alerts',     '{"lowStreak":3,"lowThreshold":2,"absenceDays":3,"noEvalDays":14}'),
+ ('info',       '{"about":"","goals":"","bio":""}'),
+ ('logoSchool', 'null'),
+ ('logoMoe',    'null')
+ON CONFLICT (key) DO NOTHING;
+//<<<END>>>
+
+//<<<FILE: database/seeds/students.csv>>>
+# الصق هنا أسماء الطالبات الـ89 (الاسم، الصف، الشعبة) — سطر لكل طالبة، والأسطر التي تبدأ بـ # تُتجاهل
+# مثال: نورة أحمد,الرابع,أ
+//<<<END>>>
+
+//<<<FILE: tests/helpers.ts>>>
+// تنبيه مهم: متغيرات بيئة الاختبار تُضبط قبل تحميل أي وحدة من الخادم (لذلك التحميل ديناميكي بعدها)
+// حتى لا تتصل الاختبارات بقاعدة lughati الحقيقية وتفرّغها — قاعدة الاختبار منفصلة دائماً.
+process.env.NODE_ENV = 'test';
+process.env.DATABASE_URL = process.env.TEST_DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/lughati_test';
+process.env.JWT_SECRET = 'test-secret-key';
+process.env.UPLOAD_DIR = 'uploads-test';
+
+import bcrypt from 'bcryptjs';
+import request from 'supertest';
+import { beforeAll } from 'vitest';
+
+const { createApp } = await import('../backend/src/app');
+const { runMigrations } = await import('../backend/src/scripts/migrate');
+const { q, pool } = await import('../backend/src/database/pool');
+
+export const app = createApp();
+
+let ready: Promise<void> | null = null;
+async function setup() {
+  await runMigrations();
+  await q(`TRUNCATE audit_logs, files, achievements, weekly_star, messages, skill_levels, skills,
+           plan_followups, plans, results, tests, worksheet_targets, worksheets, evaluations,
+           users, students, settings RESTART IDENTITY CASCADE`);
+  const h1 = bcrypt.hashSync('teacher-pass', 8);
+  const h2 = bcrypt.hashSync('student-pass', 8);
+  await q(`INSERT INTO students(id, code, name, grade, section) VALUES
+           (1,'ST-001','طالبة اختبار أ','الرابع','أ'), (2,'ST-002','طالبة اختبار ب','الرابع','أ')`);
+  await q(`INSERT INTO users(id, username, password_hash, role, student_id) VALUES
+           (1,'teacher1',$1,'teacher',NULL), (2,'studentA',$2,'student',1), (3,'studentB',$2,'student',2)`, [h1, h2]);
+}
+export function ensureReady() { ready ??= setup(); return ready; }
+
+export async function login(username: string, password: string): Promise<string> {
+  const res = await request(app).post('/api/auth/login').send({ username, password });
+  if (res.status !== 200) throw new Error('فشل تسجيل الدخول: ' + res.status + ' ' + JSON.stringify(res.body));
+  return [].concat(res.headers['set-cookie'] as any).join('; ');
+}
+export const asTeacher = async () => login('teacher1', 'teacher-pass');
+export const asStudentA = async () => login('studentA', 'student-pass');
+export const asStudentB = async () => login('studentB', 'student-pass');
+export { beforeAll, pool };
+//<<<END>>>
+
+//<<<FILE: tests/auth.test.ts>>>
+import { describe, it, expect, beforeAll } from 'vitest';
+import request from 'supertest';
+import { app, ensureReady, asTeacher, pool } from './helpers';
+
+beforeAll(() => ensureReady());
+
+describe('الاتصال الفعلي بقاعدة البيانات', () => {
+  it('GET /api/health يتحقق من اتصال PostgreSQL حقيقياً', async () => {
+    const res = await request(app).get('/api/health');
+    expect(res.status).toBe(200);
+    expect(res.body.db).toBe('ok');
+    expect(res.body.now).toBeTruthy();
+  });
+  it('استعلام مباشر يعمل', async () => {
+    const r = await pool.query('SELECT count(*)::int AS n FROM users');
+    expect(r.rows[0].n).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe('المصادقة', () => {
+  it('دخول صحيح يعيد المستخدم ويضع كوكي جلسة', async () => {
+    const res = await request(app).post('/api/auth/login').send({ username: 'teacher1', password: 'teacher-pass' });
+    expect(res.status).toBe(200);
+    expect(res.body.user.role).toBe('teacher');
+    expect(res.headers['set-cookie']).toBeTruthy();
+  });
+  it('دخول بكلمة مرور خاطئة ← 401', async () => {
+    const res = await request(app).post('/api/auth/login').send({ username: 'teacher1', password: 'wrong' });
+    expect(res.status).toBe(401);
+  });
+  it('كلمة المرور لا تُعاد أبداً في أي استجابة', async () => {
+    const res = await request(app).post('/api/auth/login').send({ username: 'teacher1', password: 'teacher-pass' });
+    expect(JSON.stringify(res.body)).not.toContain('password_hash');
+  });
+  it('مسار محمي بدون جلسة ← 401', async () => {
+    const res = await request(app).get('/api/students');
+    expect(res.status).toBe(401);
+  });
+  it('GET /api/auth/me بجلسة سليمة يعرف صاحبة الجلسة', async () => {
+    const cookie = await asTeacher();
+    const res = await request(app).get('/api/auth/me').set('Cookie', cookie);
+    expect(res.status).toBe(200);
+    expect(res.body.user.username).toBe('teacher1');
+  });
+});
+//<<<END>>>
+
+//<<<FILE: tests/rbac.test.ts>>>
+import { describe, it, expect, beforeAll } from 'vitest';
+import request from 'supertest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { app, ensureReady, asTeacher, asStudentA, asStudentB } from './helpers';
+
+beforeAll(() => ensureReady());
+
+describe('الصلاحيات تُفرض على الخادم (وليس في الواجهة)', () => {
+  it('طالبة A تحاول قراءة بيانات الطالبة B مباشرة ← 403', async () => {
+    const cookie = await asStudentA();
+    const res = await request(app).get('/api/students/2').set('Cookie', cookie);
+    expect(res.status).toBe(403);
+  });
+  it('طالبة A تحاول قراءة تقييمات الطالبة B ← 403', async () => {
+    const cookie = await asStudentA();
+    const res = await request(app).get('/api/evaluations?student_id=2').set('Cookie', cookie);
+    expect(res.status).toBe(403);
+  });
+  it('طالبة تحاول إنشاء تقييم (تزوير درجة) ← 403', async () => {
+    const cookie = await asStudentA();
+    const res = await request(app).post('/api/evaluations')
+      .set('Cookie', cookie)
+      .send({ student_id: 1, eval_date: '2025-01-01', attendance: 'present', behavior: 5, participation: 5, homework: 5 });
+    expect(res.status).toBe(403);
+  });
+  it('طالبة تحاول إدخال نتائج اختبار ← 403', async () => {
+    const t = await request(app).post('/api/tests').set('Cookie', await asTeacher())
+      .send({ title: 'اختبار الصلاحيات', kind: 'test', max_score: 10, grade: 'الرابع', section: 'أ' });
+    const cookie = await asStudentA();
+    const res = await request(app).put(`/api/tests/${t.body.id}/results`).set('Cookie', cookie)
+      .send({ rows: [{ student_id: 1, score: 10 }] });
+    expect(res.status).toBe(403);
+  });
+  it('طالبة ترسل رسالة باسم طالبة أخرى ← 403', async () => {
+    const cookie = await asStudentA();
+    const res = await request(app).post('/api/messages').set('Cookie', cookie)
+      .send({ student_id: 2, body: 'أنا لست صاحبة هذه المحادثة' });
+    expect(res.status).toBe(403);
+  });
+  it('طالبة تحاول اختيار نجم الأسبوع ← 403', async () => {
+    const cookie = await asStudentA();
+    const res = await request(app).put('/api/star').set('Cookie', cookie)
+      .send({ date: '2025-01-05', student_id: 1, reason: 'تزوير' });
+    expect(res.status).toBe(403);
+  });
+  it('طالبة تحاول قراءة سجل التدقيق ← 403', async () => {
+    const cookie = await asStudentA();
+    const res = await request(app).get('/api/audit').set('Cookie', cookie);
+    expect(res.status).toBe(403);
+  });
+  it('طالبة تحاول إنشاء حساب لطالبة ثالثة ← 403 (لا تسجيل ذاتي)', async () => {
+    const cookie = await asStudentA();
+    const res = await request(app).post('/api/users').set('Cookie', cookie)
+      .send({ username: 'hacker', password: '123456', role: 'student', student_id: 2 });
+    expect(res.status).toBe(403);
+  });
+  it('الطالبة تصل لتقريرها هي فقط، وتُمنع من تقرير غيرها', async () => {
+    const cookie = await asStudentA();
+    const ok = await request(app).get('/api/reports/student/1').set('Cookie', cookie);
+    expect(ok.status).toBe(200);
+    const no = await request(app).get('/api/reports/student/2').set('Cookie', cookie);
+    expect(no.status).toBe(403);
+  });
+  it('ملف خاص بطالبة لا تفتحه طالبة أخرى بتغيير رقم الملف، وصاحبته تفتحه', async () => {
+    // في التطبيق كل الرفع بيد المعلمة؛ هنا نُنشئ ملفاً خاصاً بطالبة مباشرة في قاعدة الاختبار
+    // لنختبر قاعدة الوصول نفسها كما لو حاول أحد التلاعب برابط التنزيل
+    const { pool } = await import('./helpers');
+    const { env } = await import('../backend/src/config');
+    fs.mkdirSync(env.uploadDirAbs, { recursive: true });
+    fs.writeFileSync(path.join(env.uploadDirAbs, 'private-x.txt'), 'private content');
+    await pool.query(
+      `INSERT INTO files(stored_name, original_name, mime, size_bytes, kind, student_id)
+       VALUES ('private-x.txt','private.txt','text/plain',15,'worksheet',1)`);
+    const privId = (await pool.query(`SELECT id FROM files WHERE stored_name='private-x.txt'`)).rows[0].id;
+    const bCookie = await asStudentB();
+    const denied = await request(app).get(`/api/files/${privId}`).set('Cookie', bCookie);
+    expect([403, 404]).toContain(denied.status);
+    const aCookie = await asStudentA();
+    const ok = await request(app).get(`/api/files/${privId}`).set('Cookie', aCookie);
+    expect(ok.status).toBe(200);
+  });
+});
+//<<<END>>>
+
+//<<<FILE: tests/evaluations.test.ts>>>
+import { describe, it, expect, beforeAll } from 'vitest';
+import request from 'supertest';
+import { app, ensureReady, asTeacher, pool } from './helpers';
+
+beforeAll(() => ensureReady());
+
+describe('التقييمات: تراكمية ومقيّدة', () => {
+  it('المعلمة تنشئ تقييماً وينجح', async () => {
+    const cookie = await asTeacher();
+    const res = await request(app).post('/api/evaluations').set('Cookie', cookie)
+      .send({ student_id: 1, eval_date: '2025-01-10', attendance: 'present', behavior: 5, participation: 4, homework: 4, notes: 'مشاركة ممتازة' });
+    expect(res.status).toBe(201);
+    expect(res.body.attendance).toBe('present');
+  });
+  it('تقييم ثانٍ بنفس التاريخ يُقبَل (التراكمية — لا كتابة فوق السابق)', async () => {
+    const cookie = await asTeacher();
+    const res = await request(app).post('/api/evaluations').set('Cookie', cookie)
+      .send({ student_id: 1, eval_date: '2025-01-10', attendance: 'present', behavior: 3, participation: 3, homework: 3 });
+    expect(res.status).toBe(201);
+    const list = await request(app).get('/api/evaluations?student_id=1').set('Cookie', cookie);
+    const sameDay = list.body.filter((e: any) => e.eval_date === '2025-01-10');
+    expect(sameDay.length).toBe(2);
+  });
+  it('درجة خارج السلم (9) ← 400', async () => {
+    const cookie = await asTeacher();
+    const res = await request(app).post('/api/evaluations').set('Cookie', cookie)
+      .send({ student_id: 1, eval_date: '2025-01-11', attendance: 'present', behavior: 9, participation: 4, homework: 4 });
+    expect(res.status).toBe(400);
+  });
+  it('درجات لطالبة غائبة ← 400 (الحضور مستقل عن الدرجات)', async () => {
+    const cookie = await asTeacher();
+    const res = await request(app).post('/api/evaluations').set('Cookie', cookie)
+      .send({ student_id: 1, eval_date: '2025-01-12', attendance: 'absent', behavior: 4, participation: 4, homework: 4 });
+    expect(res.status).toBe(400);
+    const ok = await request(app).post('/api/evaluations').set('Cookie', cookie)
+      .send({ student_id: 1, eval_date: '2025-01-12', attendance: 'absent' });
+    expect(ok.status).toBe(201);
+    expect(ok.body.behavior).toBeNull();
+  });
+  it('كل عملية إنشاء/حذف تقييم تُسجَّل في سجل التدقيق', async () => {
+    const cookie = await asTeacher();
+    const created = await request(app).post('/api/evaluations').set('Cookie', cookie)
+      .send({ student_id: 1, eval_date: '2025-01-13', attendance: 'present', behavior: 4, participation: 4, homework: 4 });
+    await request(app).delete(`/api/evaluations/${created.body.id}`).set('Cookie', cookie);
+    const logs = await pool.query(`SELECT action FROM audit_logs WHERE entity = 'evaluation' ORDER BY id DESC LIMIT 2`);
+    expect(logs.rows.map(r => r.action)).toEqual(['evaluation.delete', 'evaluation.create']);
+  });
+});
+//<<<END>>>
+
+//<<<FILE: tests/misc.test.ts>>>
+import { describe, it, expect, beforeAll } from 'vitest';
+import request from 'supertest';
+import { app, ensureReady, asTeacher, asStudentA } from './helpers';
+
+beforeAll(() => ensureReady());
+
+describe('نجم الأسبوع (أميرتي هذا الأسبوع)', () => {
+  it('المعلمة تختار نجمة الأسبوع ويُطبق قاعدة الأحد، وإعادة الاختيار تحدّث نفس الأسبوع', async () => {
+    const cookie = await asTeacher();
+    const r1 = await request(app).put('/api/star').set('Cookie', cookie)
+      .send({ date: '2025-01-08', student_id: 1, reason: 'مشاركة متميزة' }); // أربعاء ← أسبوع يبدأ 2025-01-05
+    expect(r1.status).toBe(200);
+    expect(r1.body.week_start).toBe('2025-01-05');
+    const r2 = await request(app).put('/api/star').set('Cookie', cookie)
+      .send({ date: '2025-01-09', student_id: 2, reason: 'أُعيد الاختيار' });
+    expect(r2.body.week_start).toBe('2025-01-05');
+    const all = await request(app).get('/api/star').set('Cookie', cookie);
+    const week = all.body.filter((s: any) => s.week_start === '2025-01-05');
+    expect(week.length).toBe(1); // نجمة واحدة لكل أسبوع
+  });
+  it('النجمة الحالية مرئية للطالبة', async () => {
+    const cookie = await asStudentA();
+    const res = await request(app).get('/api/star/current').set('Cookie', cookie);
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('إدارة الحسابات', () => {
+  it('المعلمة تنشئ حساب طالبة مرتبطاً برمزها الثابت', async () => {
+    const cookie = await asTeacher();
+    const res = await request(app).post('/api/users').set('Cookie', cookie)
+      .send({ username: 'st001', password: 'secret123', role: 'student', student_id: 1 });
+    expect(res.status).toBe(201);
+    expect(res.body.student_id).toBe(1);
+  });
+  it('ربط الحساب بطالبة لها حساب بالفعل ← 409، واسم مستخدم مكرر ← 409', async () => {
+    const cookie = await asTeacher();
+    const dupStudent = await request(app).post('/api/users').set('Cookie', cookie)
+      .send({ username: 'another', password: 'secret123', role: 'student', student_id: 1 });
+    expect(dupStudent.status).toBe(409);
+    const dupUser = await request(app).post('/api/users').set('Cookie', cookie)
+      .send({ username: 'st001', password: 'secret123', role: 'student', student_id: 2 });
+    expect(dupUser.status).toBe(409);
+  });
+  it('الطالبة تغير كلمتها فتُبطَل الجلسات القديمة (token_version)', async () => {
+    const cookie = await asStudentA();
+    const ch = await request(app).post('/api/auth/change-password').set('Cookie', cookie)
+      .send({ current: 'student-pass', new: 'new-pass-123' });
+    expect(ch.status).toBe(200);
+    const old = await request(app).get('/api/auth/me').set('Cookie', cookie);
+    expect(old.status).toBe(401);
+  });
+});
+//<<<END>>>
