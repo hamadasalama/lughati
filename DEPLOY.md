@@ -70,7 +70,7 @@ git push
 - يثبّت الحزم ويبني الواجهة والخادم.
 - يشغّل `seed` الذي يطبّق الترحيلات وينشئ حساب المعلمة إن لم يكن موجوداً.
 - يفحص الصحة على `/api/health`.
-- يعيد النشر عند كل `git push` إلى `main`.
+- يمكن إعادة النشر يدوياً من اللوحة، أو ربط GitHub ليعمل النشر التلقائي عند كل `git push`.
 
 ---
 
@@ -115,7 +115,8 @@ pg_dump "postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require" > lughati-backu
 
 ## 7) التحديثات والصيانة
 
-- أي تعديل على الكود: `git add . && git commit -m "..." && git push` ← يُعاد النشر تلقائياً.
+- أي تعديل على الكود: `git add . && git commit -m "..." && git push` ثم **Manual Deploy ← Deploy latest commit** من لوحة Render (المستودع عام، لذا لا يصل Webhook تلقائي عند الدفع).
+- لتفعيل النشر التلقائي: من Render ← **Settings ← Build & Deploy ← Connect GitHub** وربط المستودع (يمنح Render تطبيق GitHub على المستودع).
 - الترحيلات الجديدة في `database/migrations` تُطبَّق وحدها عند بدء الخدمة.
 - لا تضعي `JWT_SECRET` جديداً بعد النشر وإلا خرجت كل الجلسات الحالية.
 - لتغيير كلمة مرور حساب المعلمة من داخل المنصة: الإعدادات ← الأمان.
@@ -131,6 +132,7 @@ pg_dump "postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require" > lughati-backu
 | صفحة بيضاء | تأكدي أن البناء أنتج `frontend/dist` وأن أمر البدء هو `node backend/dist/server.js` |
 | الملفات اختفت | إذا كانت مرفوعة قبل الترحيل `005` فأعيدي رفعها؛ الملفات الجديدة محفوظة في القاعدة |
 | نسيت كلمة المرور | غيّري `ADMIN_PASSWORD` في Render ثم شغّلي Seed يدوياً من Shell، أو أعيدي تعيينها من قاعدة البيانات |
+| `git push` لا يطلق نشراً | المستودع مربوط كرابط عام؛ استخدمي Manual Deploy أو اربطي GitHub من إعدادات الخدمة |
 
 ---
 
